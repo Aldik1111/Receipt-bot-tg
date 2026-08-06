@@ -1,0 +1,1538 @@
+import asyncio
+import logging
+import os
+import re
+import tempfile
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+import db
+import charts
+from categorizer import categorize
+from config import BOT_TOKEN
+from formatting import money
+from receipt_pipeline import extract_receipt
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+router = Router()
+
+# ---------------------------------------------------------------------------
+# Временное хранилище "черновиков" распознанных чеков, ожидающих подтверждения
+# (в реальном проде для нескольких воркеров лучше вынести в Redis/БД, но для
+# одного процесса обычного словаря в памяти достаточно)
+# ---------------------------------------------------------------------------
+PENDING_RECEIPTS: dict[str, dict] = {}
+
+
+class ManualEntry(StatesGroup):
+    choosing_type = State()
+    entering_amount = State()
+    choosing_category = State()
+    choosing_payment = State()
+    entering_description = State()
+
+
+class CategoryEntry(StatesGroup):
+    entering_name = State()
+    editing_name = State()
+
+
+class PaymentEntry(StatesGroup):
+    entering_name = State()
+    editing_name = State()
+
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции клавиатур
+# ---------------------------------------------------------------------------
+
+def categories_keyboard(user_id: int, prefix: str) -> InlineKeyboardMarkup:
+    cats = db.get_categories(user_id)
+    buttons = [
+        [InlineKeyboardButton(text=c["name"], callback_data=f"{prefix}:{c['id']}")]
+        for c in cats
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def payments_keyboard(user_id: int, prefix: str) -> InlineKeyboardMarkup:
+    pms = db.get_payment_methods(user_id)
+    buttons = [
+        [InlineKeyboardButton(text=p["name"], callback_data=f"{prefix}:{p['id']}")]
+        for p in pms
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _with_back_button(keyboard: InlineKeyboardMarkup, back_callback: str) -> InlineKeyboardMarkup:
+    rows = list(keyboard.inline_keyboard) + [
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback)]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def period_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="Сегодня", callback_data="stats:day")],
+        [InlineKeyboardButton(text="Неделя", callback_data="stats:week")],
+        [InlineKeyboardButton(text="Месяц", callback_data="stats:month")],
+        [InlineKeyboardButton(text="3 месяца", callback_data="stats:3months")],
+        [InlineKeyboardButton(text="Год", callback_data="stats:year")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ---------------------------------------------------------------------------
+# /start
+# ---------------------------------------------------------------------------
+
+HELP_TEXT = (
+    "🤖 <b>Что я умею</b>\n\n"
+    "⚡️ <b>Быстрый ввод</b> - напиши сообщением сумму и что купил:\n"
+    "<code>500 такси</code> - расход, <code>+50000 зарплата</code> - доход.\n"
+    "Категория подбирается автоматически, поправить можно кнопкой под сообщением.\n\n"
+    "📸 <b>Фото чека</b> - пришли фото, я распознаю магазин, товары, цены и разложу "
+    "по категориям. Если распознаётся плохо - пришли чек как ФАЙЛ (📎 → Файл), "
+    "так Telegram не сжимает изображение.\n\n"
+    "➕ /add - пошаговое добавление операции с полным контролем над категорией и оплатой\n"
+    "📋 /recent - список последних операций: можно поправить сумму, категорию, "
+    "оплату, описание или удалить\n"
+    "📊 /stats - статистика за период: расходы/доходы, по категориям, топ мест трат, "
+    "по способам оплаты, динамика по времени\n"
+    "🏷 /categories - свои категории: добавить, переименовать, удалить\n"
+    "💳 /payments - способы оплаты: добавить, переименовать, удалить\n"
+    "💰 /budget - лимиты по категориям на месяц, с предупреждением при приближении\n"
+    "🎯 /goals - накопительные цели с прогресс-баром\n"
+    "🔁 /recurring - повторяющиеся платежи (аренда, подписки) - добавляются сами каждый месяц\n"
+    "🔍 /category_stats - подробная аналитика по одной категории за период\n"
+    "❓ /help - это сообщение"
+)
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    await message.answer("Привет! Я твой бюджетный менеджер.\n\n" + HELP_TEXT)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(HELP_TEXT)
+
+
+# ---------------------------------------------------------------------------
+# Обработка фото чека
+# ---------------------------------------------------------------------------
+
+@router.message(F.photo)
+async def handle_receipt_photo(message: Message, bot: Bot):
+    photo = message.photo[-1]  # берём максимальное качество из доступных превью
+    await _process_receipt(message, bot, file_id=photo.file_id, unique_id=photo.file_unique_id)
+
+
+@router.message(F.document, F.document.mime_type.startswith("image/"))
+async def handle_receipt_document(message: Message, bot: Bot):
+    # Telegram сильно сжимает фото, отправленные как "фото" - это одна из
+    # главных причин плохого распознавания. Если прислать снимок как файл
+    # (документ), сжатия нет и OCR работает заметно точнее.
+    doc = message.document
+    await _process_receipt(message, bot, file_id=doc.file_id, unique_id=doc.file_unique_id)
+
+
+async def _process_receipt(message: Message, bot: Bot, file_id: str, unique_id: str):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+
+    status = await message.answer("🔍 Распознаю чек, подожди немного...")
+
+    file = await bot.get_file(file_id)
+    local_path = os.path.join(
+        tempfile.gettempdir(),
+        f"receipt_{message.from_user.id}_{unique_id}.jpg",
+    )
+    await bot.download_file(file.file_path, destination=local_path)
+
+    try:
+        parsed = extract_receipt(local_path)
+    except Exception:
+        logger.exception("Receipt extraction error")
+        await status.edit_text(
+            "⚠️ Не получилось распознать чек. Попробуй сфотографировать ровнее, "
+            "при хорошем освещении, или добавь трату вручную - просто напиши "
+            "сообщением, например: 500 такси"
+        )
+        return
+    finally:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+    if not parsed["items"]:
+        await status.edit_text(
+            "⚠️ Не нашёл товаров на чеке (Gemini не справился).\n"
+            "Совет: пришли фото чека как ФАЙЛ (📎 → Файл, не как фото) - "
+            "так Telegram не сжимает изображение и распознавание работает точнее.\n"
+            "Либо просто напиши сообщением: 500 такси"
+        )
+        return
+
+    draft_id = f"{message.from_user.id}_{unique_id}"
+    PENDING_RECEIPTS[draft_id] = parsed
+
+    text = _format_receipt_preview(parsed)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Сохранить всё", callback_data=f"recv_save:{draft_id}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"recv_cancel:{draft_id}"),
+            ]
+        ]
+    )
+    await status.edit_text(text, reply_markup=keyboard)
+
+
+SOURCE_LABELS = {
+    "gemini": "🤖 Gemini AI",
+}
+
+
+def _format_receipt_preview(parsed: dict) -> str:
+    lines = ["🧾 <b>Распознанный чек</b>"]
+    source_label = SOURCE_LABELS.get(parsed.get("source"))
+    if source_label:
+        lines.append(f"<i>Источник: {source_label}</i>")
+    lines.append("")
+    lines.append(f"Магазин: {parsed['store'] or '—'}")
+    lines.append(f"Дата: {parsed['date'] or '—'}   Время: {parsed['time'] or '—'}\n")
+    total = 0.0
+    for item in parsed["items"]:
+        category = item.get("category", "Прочее")
+        lines.append(f"• {item['name']} — {money(item['price'])}  [{category}]")
+        total += item["price"]
+    lines.append(f"\nИтого по товарам: {money(total)}")
+    if parsed["total"] is not None:
+        lines.append(f"Итого по чеку: {money(parsed['total'])}")
+    lines.append(
+        "\nЕсли что-то распознано неверно - удобнее скорректировать это "
+        "потом прямо в базе, либо переснять чек. Проверь и сохрани."
+    )
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("recv_save:"))
+async def confirm_receipt_save(callback: CallbackQuery):
+    draft_id = callback.data.split(":", 1)[1]
+    parsed = PENDING_RECEIPTS.pop(draft_id, None)
+    if not parsed:
+        await callback.answer("Черновик устарел, пришли фото заново", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    op_date = parsed["date"] or date.today().strftime("%Y-%m-%d")
+
+    # По умолчанию используем "Наличные", если он есть, иначе первый попавшийся
+    payment_method_id = db.get_default_payment_method_id(user_id)
+
+    receipt_id = db.create_receipt(
+        user_id=user_id,
+        store=parsed["store"],
+        receipt_date=parsed["date"],
+        receipt_time=parsed["time"],
+        payment_method_id=payment_method_id,
+        raw_text=parsed["raw_text"],
+    )
+
+    touched_categories = set()
+    for item in parsed["items"]:
+        cat_id = db.get_category_id_by_name(user_id, item["category"])
+        touched_categories.add(cat_id)
+        db.add_transaction(
+            user_id=user_id,
+            tx_type="expense",
+            amount=item["price"],
+            category_id=cat_id,
+            payment_method_id=payment_method_id,
+            store=parsed["store"],
+            description=item["name"],
+            op_date=op_date,
+            op_time=parsed["time"],
+            receipt_id=receipt_id,
+        )
+
+    await callback.message.edit_text(
+        callback.message.text + "\n\n✅ Сохранено в базу!", reply_markup=None
+    )
+    for cat_id in touched_categories:
+        warning = await _budget_warning_text(user_id, cat_id)
+        if warning:
+            await callback.message.answer(warning)
+    await callback.answer("Сохранено")
+
+
+@router.callback_query(F.data.startswith("recv_cancel:"))
+async def cancel_receipt_save(callback: CallbackQuery):
+    draft_id = callback.data.split(":", 1)[1]
+    PENDING_RECEIPTS.pop(draft_id, None)
+    await callback.message.edit_text("❌ Отменено, ничего не сохранено.", reply_markup=None)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Ручное добавление операции: /add
+# ---------------------------------------------------------------------------
+
+@router.message(Command("add"))
+async def cmd_add(message: Message, state: FSMContext):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💸 Расход", callback_data="type:expense"),
+                InlineKeyboardButton(text="💰 Доход", callback_data="type:income"),
+            ]
+        ]
+    )
+    await message.answer("Что добавляем?", reply_markup=keyboard)
+    await state.set_state(ManualEntry.choosing_type)
+
+
+@router.callback_query(ManualEntry.choosing_type, F.data.startswith("type:"))
+async def add_choose_type(callback: CallbackQuery, state: FSMContext):
+    tx_type = callback.data.split(":", 1)[1]
+    await state.update_data(tx_type=tx_type)
+    await callback.message.edit_text("Введи сумму:")
+    await state.set_state(ManualEntry.entering_amount)
+    await callback.answer()
+
+
+@router.message(ManualEntry.entering_amount)
+async def add_enter_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Пришли число, например: 350 или 350.50")
+        return
+
+    await state.update_data(amount=amount)
+    await message.answer(
+        "Выбери категорию:",
+        reply_markup=categories_keyboard(message.from_user.id, "cat"),
+    )
+    await state.set_state(ManualEntry.choosing_category)
+
+
+@router.callback_query(ManualEntry.choosing_category, F.data.startswith("cat:"))
+async def add_choose_category(callback: CallbackQuery, state: FSMContext):
+    category_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(category_id=category_id)
+    await callback.message.edit_text(
+        "Способ оплаты:",
+        reply_markup=payments_keyboard(callback.from_user.id, "pay"),
+    )
+    await state.set_state(ManualEntry.choosing_payment)
+    await callback.answer()
+
+
+@router.callback_query(ManualEntry.choosing_payment, F.data.startswith("pay:"))
+async def add_choose_payment(callback: CallbackQuery, state: FSMContext):
+    payment_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(payment_method_id=payment_id)
+    await callback.message.edit_text("Короткое описание (или отправь '-' чтобы пропустить):")
+    await state.set_state(ManualEntry.entering_description)
+    await callback.answer()
+
+
+@router.message(ManualEntry.entering_description)
+async def add_enter_description(message: Message, state: FSMContext):
+    data = await state.get_data()
+    description = None if message.text.strip() == "-" else message.text.strip()
+
+    tx_id = db.add_transaction(
+        user_id=message.from_user.id,
+        tx_type=data["tx_type"],
+        amount=data["amount"],
+        category_id=data["category_id"],
+        payment_method_id=data["payment_method_id"],
+        store=None,
+        description=description,
+        op_date=date.today().strftime("%Y-%m-%d"),
+        op_time=datetime.now().strftime("%H:%M"),
+    )
+    await state.clear()
+    emoji = "💰" if data["tx_type"] == "income" else "💸"
+    text = f"{emoji} Записано: {money(data['amount'])} — {description or 'без описания'}"
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✏️ Изменить", callback_data=f"tx_open:{tx_id}")]]
+    )
+    await message.answer(text, reply_markup=keyboard)
+    if data["tx_type"] == "expense":
+        warning = await _budget_warning_text(message.from_user.id, data["category_id"])
+        if warning:
+            await message.answer(warning)
+
+
+# ---------------------------------------------------------------------------
+# Статистика: /stats
+# ---------------------------------------------------------------------------
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    await message.answer("За какой период?", reply_markup=period_keyboard())
+
+
+def _previous_period_bounds(date_from: str, date_to: str) -> tuple[str, str]:
+    """Предыдущий период той же длины, сразу перед текущим - для сравнения."""
+    d_from = date.fromisoformat(date_from)
+    d_to = date.fromisoformat(date_to)
+    length = (d_to - d_from).days + 1
+    prev_to = d_from - timedelta(days=1)
+    prev_from = prev_to - timedelta(days=length - 1)
+    return prev_from.isoformat(), prev_to.isoformat()
+
+
+def _pct_change(current: float, previous: float) -> str:
+    if previous <= 0:
+        return "н/д" if current <= 0 else "новое"
+    change = (current - previous) / previous * 100
+    arrow = "🔺" if change > 0 else ("🔻" if change < 0 else "▪️")
+    return f"{arrow} {abs(change):.0f}%"
+
+
+async def _budget_warning_text(user_id: int, category_id: int | None) -> str | None:
+    if category_id is None:
+        return None
+    budget = db.get_budget_for_category(user_id, category_id)
+    if not budget:
+        return None
+    today = date.today()
+    start = today.replace(day=1)
+    spent = db.get_category_spent(user_id, category_id, start.isoformat(), today.isoformat())
+    limit = budget["monthly_limit"]
+    pct = (spent / limit * 100) if limit > 0 else 0
+    name = db.get_category_name(user_id, category_id) or "?"
+    if pct >= 100:
+        return f"⚠️ Бюджет по «{name}» превышен: {money(spent)} из {money(limit)} ({pct:.0f}%)"
+    if pct >= 80:
+        return f"🟡 Бюджет по «{name}»: {money(spent)} из {money(limit)} ({pct:.0f}%)"
+    return None
+
+
+def _period_bounds(period: str) -> tuple[str, str, str]:
+    today = date.today()
+    if period == "day":
+        return today.isoformat(), today.isoformat(), "за сегодня"
+    if period == "week":
+        start = today - timedelta(days=today.weekday())
+        return start.isoformat(), today.isoformat(), "за неделю"
+    if period == "month":
+        start = today.replace(day=1)
+        return start.isoformat(), today.isoformat(), "за месяц"
+    if period == "3months":
+        start = (today.replace(day=1) - timedelta(days=62)).replace(day=1)
+        return start.isoformat(), today.isoformat(), "за 3 месяца"
+    if period == "year":
+        start = today.replace(month=1, day=1)
+        return start.isoformat(), today.isoformat(), "за год"
+    raise ValueError(period)
+
+
+RU_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+RU_MONTHS = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
+
+
+@router.callback_query(F.data.startswith("stats:"))
+async def show_stats(callback: CallbackQuery):
+    period = callback.data.split(":", 1)[1]
+    date_from, date_to, label = _period_bounds(period)
+    user_id = callback.from_user.id
+
+    rows = db.get_transactions(user_id, date_from, date_to)
+    expenses = [dict(r) for r in rows if r["type"] == "expense"]
+    incomes = [dict(r) for r in rows if r["type"] == "income"]
+
+    total_expense = sum(r["amount"] for r in expenses)
+    total_income = sum(r["amount"] for r in incomes)
+
+    prev_from, prev_to = _previous_period_bounds(date_from, date_to)
+    prev_expense = db.get_total_expense(user_id, prev_from, prev_to)
+
+    summary = (
+        f"📊 <b>Статистика {label}</b>\n"
+        f"Период: {date_from} — {date_to}\n\n"
+        f"💸 Расходы: {money(total_expense)}  ({_pct_change(total_expense, prev_expense)} к прошлому периоду)\n"
+        f"💰 Доходы: {money(total_income)}\n"
+        f"Баланс: {money(total_income - total_expense)}"
+    )
+    show_list_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="📋 Показать операции", callback_data=f"recent_from:{date_from}:{date_to}"
+    )]])
+    await callback.message.answer(summary, reply_markup=show_list_kb)
+
+    if not expenses:
+        await callback.message.answer("Расходов за этот период нет.")
+        await callback.answer()
+        return
+
+    buf = charts.pie_chart_by_category(expenses, f"Расходы {label}")
+    await callback.message.answer_photo(BufferedInputFile(buf.read(), filename="by_category.png"))
+
+    # Куда - топ магазинов/мест
+    store_totals: dict[str, float] = defaultdict(float)
+    for e in expenses:
+        if e["store"]:
+            store_totals[e["store"]] += e["amount"]
+    if store_totals:
+        top_stores = sorted(store_totals.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        lines = ["📍 <b>Топ мест трат</b>"]
+        for name, amount in top_stores:
+            lines.append(f"• {name} — {money(amount)}")
+        await callback.message.answer("\n".join(lines))
+
+    # Способы оплаты
+    pay_totals: dict[str, float] = defaultdict(float)
+    for e in expenses:
+        pay_totals[e["payment_name"] or "Без указания"] += e["amount"]
+    if len(pay_totals) > 1 or "Без указания" not in pay_totals:
+        lines = ["💳 <b>По способам оплаты</b>"]
+        for name, amount in sorted(pay_totals.items(), key=lambda kv: kv[1], reverse=True):
+            lines.append(f"• {name} — {money(amount)}")
+        await callback.message.answer("\n".join(lines))
+
+    # Когда - тренд трат по времени (не строим для одного дня - смысла мало)
+    if period != "day":
+        buckets: dict[str, float] = {}
+        for e in expenses:
+            d = date.fromisoformat(e["op_date"])
+            if period == "week":
+                key = f"{RU_WEEKDAYS[d.weekday()]} {d.day:02d}"
+            elif period == "month":
+                key = f"{d.day:02d}.{d.month:02d}"
+            elif period == "3months":
+                key = f"Нед.{d.isocalendar()[1]}"
+            else:  # year
+                key = RU_MONTHS[d.month - 1]
+            buckets[key] = buckets.get(key, 0) + e["amount"]
+        if len(buckets) > 1:
+            buf2 = charts.bar_chart_by_period(buckets, f"Динамика трат {label}")
+            await callback.message.answer_photo(BufferedInputFile(buf2.read(), filename="trend.png"))
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("recent_from:"))
+async def recent_from_stats(callback: CallbackQuery):
+    _, date_from, date_to = callback.data.split(":")
+    text, keyboard = _recent_view(callback.from_user.id, date_from, date_to, 0)
+    await callback.message.answer(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Категории: /categories
+# ---------------------------------------------------------------------------
+
+PROTECTED_CATEGORY = "Прочее"  # на неё переносятся траты при удалении других категорий
+
+
+def _categories_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    cats = db.get_categories(user_id)
+    text = "🏷 <b>Твои категории</b>\n\nНажми ✏️ чтобы переименовать, 🗑 чтобы удалить."
+
+    buttons = []
+    for c in cats:
+        if c["name"] == PROTECTED_CATEGORY:
+            buttons.append([InlineKeyboardButton(text=f"🔒 {c['name']}", callback_data="noop")])
+        else:
+            buttons.append([
+                InlineKeyboardButton(text=c["name"], callback_data="noop"),
+                InlineKeyboardButton(text="✏️", callback_data=f"cat_edit:{c['id']}"),
+                InlineKeyboardButton(text="🗑", callback_data=f"cat_del:{c['id']}"),
+            ])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить категорию", callback_data="cat_add")])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("categories"))
+async def cmd_categories(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    text, keyboard = _categories_view(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "noop")
+async def noop_callback(callback: CallbackQuery):
+    await callback.answer("Это базовая категория - её нельзя переименовать или удалить")
+
+
+@router.callback_query(F.data == "cat_add")
+async def cat_add_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введи название новой категории:")
+    await state.set_state(CategoryEntry.entering_name)
+    await callback.answer()
+
+
+@router.message(CategoryEntry.entering_name)
+async def add_category_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    db.add_category(message.from_user.id, name)
+    await state.clear()
+    text, keyboard = _categories_view(message.from_user.id)
+    await message.answer(f"✅ Категория «{name}» добавлена.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("cat_edit:"))
+async def cat_edit_start(callback: CallbackQuery, state: FSMContext):
+    cat_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(edit_cat_id=cat_id)
+    await state.set_state(CategoryEntry.editing_name)
+    await callback.message.edit_text("Введи новое название для этой категории:")
+    await callback.answer()
+
+
+@router.message(CategoryEntry.editing_name)
+async def edit_category_name(message: Message, state: FSMContext):
+    data = await state.get_data()
+    cat_id = data["edit_cat_id"]
+    new_name = message.text.strip()
+    ok = db.rename_category(message.from_user.id, cat_id, new_name)
+    await state.clear()
+
+    text, keyboard = _categories_view(message.from_user.id)
+    if ok:
+        await message.answer(f"✅ Переименовано в «{new_name}».\n\n{text}", reply_markup=keyboard)
+    else:
+        await message.answer(
+            f"⚠️ Категория «{new_name}» уже есть - выбери другое название.\n\n{text}",
+            reply_markup=keyboard,
+        )
+
+
+@router.callback_query(F.data.startswith("cat_del:"))
+async def cat_delete_confirm(callback: CallbackQuery):
+    cat_id = int(callback.data.split(":", 1)[1])
+    count = db.count_transactions_for_category(callback.from_user.id, cat_id)
+    note = (
+        f"У неё {count} операций - они будут перенесены в «{PROTECTED_CATEGORY}»."
+        if count
+        else "Операций с ней пока нет."
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"cat_del_yes:{cat_id}"),
+                InlineKeyboardButton(text="◀️ Отмена", callback_data="cat_del_no"),
+            ]
+        ]
+    )
+    await callback.message.edit_text(f"Удалить эту категорию?\n{note}", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cat_del_yes:"))
+async def cat_delete_apply(callback: CallbackQuery):
+    cat_id = int(callback.data.split(":", 1)[1])
+    ok = db.delete_category(callback.from_user.id, cat_id, fallback_name=PROTECTED_CATEGORY)
+    text, keyboard = _categories_view(callback.from_user.id)
+    prefix = "✅ Удалено.\n\n" if ok else "⚠️ Не удалось удалить.\n\n"
+    await callback.message.edit_text(prefix + text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cat_del_no")
+async def cat_delete_cancel(callback: CallbackQuery):
+    text, keyboard = _categories_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Способы оплаты: /payments
+# ---------------------------------------------------------------------------
+
+def _payments_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    pms = db.get_payment_methods(user_id)
+    text = "💳 <b>Твои способы оплаты</b>\n\nНажми ✏️ чтобы переименовать, 🗑 чтобы удалить."
+
+    buttons = []
+    for p in pms:
+        buttons.append([
+            InlineKeyboardButton(text=p["name"], callback_data="noop_pay"),
+            InlineKeyboardButton(text="✏️", callback_data=f"pay_edit:{p['id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"pay_del:{p['id']}"),
+        ])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить способ оплаты", callback_data="pay_add")])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("payments"))
+async def cmd_payments(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    text, keyboard = _payments_view(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "noop_pay")
+async def noop_pay_callback(callback: CallbackQuery):
+    await callback.answer()
+
+
+@router.callback_query(F.data == "pay_add")
+async def pay_add_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введи название способа оплаты (например: Kaspi Gold, Тинькофф):")
+    await state.set_state(PaymentEntry.entering_name)
+    await callback.answer()
+
+
+@router.message(PaymentEntry.entering_name)
+async def add_payment_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    db.add_payment_method(message.from_user.id, name)
+    await state.clear()
+    text, keyboard = _payments_view(message.from_user.id)
+    await message.answer(f"✅ Способ оплаты «{name}» добавлен.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("pay_edit:"))
+async def pay_edit_start(callback: CallbackQuery, state: FSMContext):
+    pm_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(edit_pm_id=pm_id)
+    await state.set_state(PaymentEntry.editing_name)
+    await callback.message.edit_text("Введи новое название для этого способа оплаты:")
+    await callback.answer()
+
+
+@router.message(PaymentEntry.editing_name)
+async def edit_payment_name(message: Message, state: FSMContext):
+    data = await state.get_data()
+    pm_id = data["edit_pm_id"]
+    new_name = message.text.strip()
+    ok = db.rename_payment_method(message.from_user.id, pm_id, new_name)
+    await state.clear()
+
+    text, keyboard = _payments_view(message.from_user.id)
+    if ok:
+        await message.answer(f"✅ Переименовано в «{new_name}».\n\n{text}", reply_markup=keyboard)
+    else:
+        await message.answer(
+            f"⚠️ Способ оплаты «{new_name}» уже есть - выбери другое название.\n\n{text}",
+            reply_markup=keyboard,
+        )
+
+
+@router.callback_query(F.data.startswith("pay_del:"))
+async def pay_delete_confirm(callback: CallbackQuery):
+    pm_id = int(callback.data.split(":", 1)[1])
+    count = db.count_transactions_for_payment_method(callback.from_user.id, pm_id)
+    note = (
+        f"У него {count} операций - способ оплаты у них станет пустым."
+        if count
+        else "Операций с ним пока нет."
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"pay_del_yes:{pm_id}"),
+                InlineKeyboardButton(text="◀️ Отмена", callback_data="pay_del_no"),
+            ]
+        ]
+    )
+    await callback.message.edit_text(f"Удалить этот способ оплаты?\n{note}", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pay_del_yes:"))
+async def pay_delete_apply(callback: CallbackQuery):
+    pm_id = int(callback.data.split(":", 1)[1])
+    ok = db.delete_payment_method(callback.from_user.id, pm_id)
+    text, keyboard = _payments_view(callback.from_user.id)
+    if ok:
+        prefix = "✅ Удалено.\n\n"
+    else:
+        prefix = "⚠️ Нельзя удалить последний оставшийся способ оплаты.\n\n"
+    await callback.message.edit_text(prefix + text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "pay_del_no")
+async def pay_delete_cancel(callback: CallbackQuery):
+    text, keyboard = _payments_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Быстрый ввод одной строкой текста, без единого клика: "500 такси" / "+50000 зарплата"
+# Срабатывает только когда пользователь не находится в другом сценарии (FSM state=None)
+# ---------------------------------------------------------------------------
+
+QUICK_ADD_RE = re.compile(r"^\s*([+-]?\d+(?:[.,]\d+)?)\s*(.*)$", re.DOTALL)
+
+
+@router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
+async def quick_add(message: Message, state: FSMContext):
+    match = QUICK_ADD_RE.match(message.text)
+    if not match:
+        await message.answer(
+            "Не понял 🤔 Формат: <b>сумма</b> и что купил, например:\n"
+            "<code>500 такси</code>  или  <code>+50000 зарплата</code>\n"
+            "Либо используй /add для пошагового ввода."
+        )
+        return
+
+    amount_raw, description_raw = match.groups()
+    db.ensure_user(message.from_user.id, message.from_user.username)
+
+    tx_type = "income" if amount_raw.strip().startswith("+") else "expense"
+    try:
+        amount = abs(float(amount_raw.replace(",", ".")))
+    except ValueError:
+        await message.answer("Не смог разобрать сумму, попробуй ещё раз.")
+        return
+    if amount <= 0:
+        await message.answer("Сумма должна быть больше нуля.")
+        return
+
+    description = description_raw.strip() or None
+    category_name = categorize(description) if description else "Прочее"
+    category_id = db.get_category_id_by_name(message.from_user.id, category_name)
+    payment_method_id = db.get_default_payment_method_id(message.from_user.id)
+
+    tx_id = db.add_transaction(
+        user_id=message.from_user.id,
+        tx_type=tx_type,
+        amount=amount,
+        category_id=category_id,
+        payment_method_id=payment_method_id,
+        store=None,
+        description=description,
+        op_date=date.today().strftime("%Y-%m-%d"),
+        op_time=datetime.now().strftime("%H:%M"),
+    )
+
+    emoji = "💰" if tx_type == "income" else "💸"
+    text = f"{emoji} Записано: {money(amount)} — {description or 'без описания'}\nКатегория: {category_name}"
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✏️ Изменить", callback_data=f"tx_open:{tx_id}")]]
+    )
+    await message.answer(text, reply_markup=keyboard)
+    if tx_type == "expense":
+        warning = await _budget_warning_text(message.from_user.id, category_id)
+        if warning:
+            await message.answer(warning)
+
+
+# ---------------------------------------------------------------------------
+# Просмотр и редактирование операций: /recent
+# ---------------------------------------------------------------------------
+
+PAGE_SIZE = 8
+TYPE_EMOJI = {"expense": "💸", "income": "💰"}
+
+# Последний открытый пользователем список операций (фильтр по датам + номер
+# страницы) - нужно, чтобы кнопка "◀️ Назад" из карточки операции возвращала
+# туда же, откуда пришли, а не всегда на первую страницу без фильтра.
+LIST_CONTEXT: dict[int, tuple[str | None, str | None, int]] = {}
+
+
+def _recent_view(
+    user_id: int, date_from: str | None, date_to: str | None, page: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    LIST_CONTEXT[user_id] = (date_from, date_to, page)
+
+    total = db.count_all_transactions(user_id, date_from, date_to)
+    rows = db.get_recent_transactions(
+        user_id, limit=PAGE_SIZE, offset=page * PAGE_SIZE, date_from=date_from, date_to=date_to
+    )
+
+    if date_from and date_to:
+        header = f"📋 <b>Операции за период</b>\n{date_from} — {date_to}"
+    else:
+        header = "📋 <b>Последние операции</b>"
+
+    if not rows:
+        return header + "\n\nЗдесь пока пусто.", InlineKeyboardMarkup(inline_keyboard=[])
+
+    lines = [header, ""]
+    buttons = []
+    for r in rows:
+        emoji = TYPE_EMOJI.get(r["type"], "•")
+        label = r["description"] or r["store"] or "без описания"
+        cat = f" [{r['category_name']}]" if r["category_name"] else ""
+        lines.append(f"{emoji} {r['op_date']} · {money(r['amount'])} · {label}{cat}")
+        buttons.append([InlineKeyboardButton(
+            text=f"✏️ {r['op_date']} · {money(r['amount'])} · {label}"[:60],
+            callback_data=f"tx_open:{r['id']}",
+        )])
+
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    lines.append(f"\nСтраница {page + 1} из {total_pages}")
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ Раньше", callback_data="recent_page:prev"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton(text="Позже ▶️", callback_data="recent_page:next"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("recent"))
+async def cmd_recent(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    text, keyboard = _recent_view(message.from_user.id, None, None, 0)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("recent_page:"))
+async def recent_page_nav(callback: CallbackQuery):
+    direction = callback.data.split(":", 1)[1]
+    date_from, date_to, page = LIST_CONTEXT.get(callback.from_user.id, (None, None, 0))
+    page = page + 1 if direction == "next" else max(0, page - 1)
+    text, keyboard = _recent_view(callback.from_user.id, date_from, date_to, page)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "recent_back")
+async def recent_back(callback: CallbackQuery):
+    date_from, date_to, page = LIST_CONTEXT.get(callback.from_user.id, (None, None, 0))
+    text, keyboard = _recent_view(callback.from_user.id, date_from, date_to, page)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+def _tx_detail_view(user_id: int, tx_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    r = db.get_transaction_by_id(user_id, tx_id)
+    if not r:
+        return None
+
+    emoji = TYPE_EMOJI.get(r["type"], "•")
+    lines = [
+        f"{emoji} <b>{money(r['amount'])}</b>",
+        f"Дата: {r['op_date']}" + (f"  Время: {r['op_time']}" if r["op_time"] else ""),
+        f"Категория: {r['category_name'] or '—'}",
+        f"Способ оплаты: {r['payment_name'] or '—'}",
+        f"Магазин: {r['store'] or '—'}",
+        f"Описание: {r['description'] or '—'}",
+    ]
+    text = "\n".join(lines)
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✏️ Сумма", callback_data=f"tx_amount:{tx_id}"),
+                InlineKeyboardButton(text="🏷 Категория", callback_data=f"tx_cat:{tx_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="💳 Оплата", callback_data=f"tx_pay:{tx_id}"),
+                InlineKeyboardButton(text="📝 Описание", callback_data=f"tx_desc:{tx_id}"),
+            ],
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"tx_del:{tx_id}")],
+            [InlineKeyboardButton(text="◀️ К списку", callback_data="recent_back")],
+        ]
+    )
+    return text, keyboard
+
+
+@router.callback_query(F.data.startswith("tx_open:"))
+async def tx_open(callback: CallbackQuery):
+    tx_id = int(callback.data.split(":", 1)[1])
+    view = _tx_detail_view(callback.from_user.id, tx_id)
+    if not view:
+        await callback.answer("Операция не найдена (возможно, уже удалена)", show_alert=True)
+        return
+    text, keyboard = view
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+class TransactionEdit(StatesGroup):
+    entering_amount = State()
+    entering_description = State()
+
+
+@router.callback_query(F.data.startswith("tx_amount:"))
+async def tx_edit_amount_start(callback: CallbackQuery, state: FSMContext):
+    tx_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(edit_tx_id=tx_id)
+    await state.set_state(TransactionEdit.entering_amount)
+    await callback.message.edit_text("Введи новую сумму:")
+    await callback.answer()
+
+
+@router.message(TransactionEdit.entering_amount)
+async def tx_edit_amount_apply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    tx_id = data["edit_tx_id"]
+    try:
+        amount = float(message.text.replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Пришли число больше нуля, например: 350")
+        return
+    db.update_transaction_amount(message.from_user.id, tx_id, amount)
+    await state.clear()
+    view = _tx_detail_view(message.from_user.id, tx_id)
+    text, keyboard = view
+    await message.answer(f"✅ Сумма обновлена.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("tx_desc:"))
+async def tx_edit_desc_start(callback: CallbackQuery, state: FSMContext):
+    tx_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(edit_tx_id=tx_id)
+    await state.set_state(TransactionEdit.entering_description)
+    await callback.message.edit_text("Новое описание (или '-' чтобы убрать):")
+    await callback.answer()
+
+
+@router.message(TransactionEdit.entering_description)
+async def tx_edit_desc_apply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    tx_id = data["edit_tx_id"]
+    new_desc = None if message.text.strip() == "-" else message.text.strip()
+    db.update_transaction_description(message.from_user.id, tx_id, new_desc)
+    await state.clear()
+    text, keyboard = _tx_detail_view(message.from_user.id, tx_id)
+    await message.answer(f"✅ Описание обновлено.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("tx_cat:"))
+async def tx_edit_category_start(callback: CallbackQuery):
+    tx_id = int(callback.data.split(":", 1)[1])
+    keyboard = _with_back_button(
+        categories_keyboard(callback.from_user.id, f"tx_setcat:{tx_id}"),
+        back_callback=f"tx_open:{tx_id}",
+    )
+    await callback.message.edit_text("Выбери новую категорию:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tx_setcat:"))
+async def tx_edit_category_apply(callback: CallbackQuery):
+    _, tx_id, cat_id = callback.data.split(":")
+    db.update_transaction_category(callback.from_user.id, int(tx_id), int(cat_id))
+    text, keyboard = _tx_detail_view(callback.from_user.id, int(tx_id))
+    await callback.message.edit_text(f"✅ Категория обновлена.\n\n{text}", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tx_pay:"))
+async def tx_edit_payment_start(callback: CallbackQuery):
+    tx_id = int(callback.data.split(":", 1)[1])
+    keyboard = _with_back_button(
+        payments_keyboard(callback.from_user.id, f"tx_setpay:{tx_id}"),
+        back_callback=f"tx_open:{tx_id}",
+    )
+    await callback.message.edit_text("Выбери новый способ оплаты:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tx_setpay:"))
+async def tx_edit_payment_apply(callback: CallbackQuery):
+    _, tx_id, pm_id = callback.data.split(":")
+    db.update_transaction_payment_method(callback.from_user.id, int(tx_id), int(pm_id))
+    text, keyboard = _tx_detail_view(callback.from_user.id, int(tx_id))
+    await callback.message.edit_text(f"✅ Способ оплаты обновлён.\n\n{text}", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tx_del:"))
+async def tx_delete_confirm(callback: CallbackQuery):
+    tx_id = int(callback.data.split(":", 1)[1])
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"tx_del_yes:{tx_id}"),
+                InlineKeyboardButton(text="◀️ Отмена", callback_data=f"tx_open:{tx_id}"),
+            ]
+        ]
+    )
+    await callback.message.edit_text("Удалить эту операцию без возможности восстановить?", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tx_del_yes:"))
+async def tx_delete_apply(callback: CallbackQuery):
+    tx_id = int(callback.data.split(":", 1)[1])
+    db.delete_transaction(callback.from_user.id, tx_id)
+    date_from, date_to, page = LIST_CONTEXT.get(callback.from_user.id, (None, None, 0))
+    text, keyboard = _recent_view(callback.from_user.id, date_from, date_to, page)
+    await callback.message.edit_text("✅ Удалено.\n\n" + text, reply_markup=keyboard)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Бюджеты по категориям: /budget
+# ---------------------------------------------------------------------------
+
+class BudgetEntry(StatesGroup):
+    entering_limit = State()
+
+
+def _budget_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    budgets = db.get_budgets(user_id)
+    today = date.today()
+    start = today.replace(day=1)
+    lines = ["💰 <b>Бюджеты по категориям</b>", ""]
+    buttons = []
+    if not budgets:
+        lines.append("Пока не задано ни одного лимита.")
+    for b in budgets:
+        spent = db.get_category_spent(user_id, b["category_id"], start.isoformat(), today.isoformat())
+        pct = (spent / b["monthly_limit"] * 100) if b["monthly_limit"] > 0 else 0
+        emoji = "🔴" if pct >= 100 else ("🟡" if pct >= 80 else "🟢")
+        lines.append(f"{emoji} {b['category_name']}: {money(spent)} / {money(b['monthly_limit'])} ({pct:.0f}%)")
+        buttons.append([
+            InlineKeyboardButton(text=f"✏️ {b['category_name']}", callback_data=f"bud_pick:{b['category_id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"bud_del:{b['id']}"),
+        ])
+    buttons.append([InlineKeyboardButton(text="➕ Установить лимит", callback_data="bud_add")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("budget"))
+async def cmd_budget(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    text, keyboard = _budget_view(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "bud_add")
+async def bud_add_start(callback: CallbackQuery):
+    keyboard = categories_keyboard(callback.from_user.id, "bud_pick")
+    await callback.message.edit_text("Для какой категории задать лимит?", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bud_pick:"))
+async def bud_pick_category(callback: CallbackQuery, state: FSMContext):
+    cat_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(budget_cat_id=cat_id)
+    await state.set_state(BudgetEntry.entering_limit)
+    await callback.message.edit_text("Введи месячный лимит для этой категории (число, без пробелов):")
+    await callback.answer()
+
+
+@router.message(BudgetEntry.entering_limit)
+async def bud_enter_limit(message: Message, state: FSMContext):
+    try:
+        limit = float(message.text.replace(",", "."))
+        if limit <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Пришли число больше нуля, например: 100000")
+        return
+    data = await state.get_data()
+    db.set_budget(message.from_user.id, data["budget_cat_id"], limit)
+    await state.clear()
+    text, keyboard = _budget_view(message.from_user.id)
+    await message.answer(f"✅ Лимит установлен.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("bud_del:"))
+async def bud_delete(callback: CallbackQuery):
+    budget_id = int(callback.data.split(":", 1)[1])
+    db.delete_budget(callback.from_user.id, budget_id)
+    text, keyboard = _budget_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer("Удалено")
+
+
+# ---------------------------------------------------------------------------
+# Накопительные цели: /goals
+# ---------------------------------------------------------------------------
+
+class GoalEntry(StatesGroup):
+    entering_name = State()
+    entering_target = State()
+
+
+class GoalContribute(StatesGroup):
+    entering_amount = State()
+
+
+def _progress_bar(pct: float) -> str:
+    filled = round(min(pct, 100) / 10)
+    return "🟩" * filled + "⬜" * (10 - filled)
+
+
+def _goals_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    goals = db.get_goals(user_id)
+    lines = ["🎯 <b>Накопительные цели</b>", ""]
+    buttons = []
+    if not goals:
+        lines.append("Пока нет ни одной цели.")
+    for g in goals:
+        pct = (g["current_amount"] / g["target_amount"] * 100) if g["target_amount"] > 0 else 0
+        lines.append(
+            f"<b>{g['name']}</b>: {money(g['current_amount'])} / {money(g['target_amount'])}\n"
+            f"{_progress_bar(pct)} {pct:.0f}%"
+        )
+        buttons.append([
+            InlineKeyboardButton(text=f"➕ Пополнить «{g['name']}»", callback_data=f"goal_add:{g['id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"goal_del:{g['id']}"),
+        ])
+    buttons.append([InlineKeyboardButton(text="➕ Новая цель", callback_data="goal_new")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("goals"))
+async def cmd_goals(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    text, keyboard = _goals_view(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "goal_new")
+async def goal_new_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(GoalEntry.entering_name)
+    await callback.message.edit_text("Название цели (например: Отпуск):")
+    await callback.answer()
+
+
+@router.message(GoalEntry.entering_name)
+async def goal_enter_name(message: Message, state: FSMContext):
+    await state.update_data(goal_name=message.text.strip())
+    await state.set_state(GoalEntry.entering_target)
+    await message.answer("Сколько нужно накопить (число)?")
+
+
+@router.message(GoalEntry.entering_target)
+async def goal_enter_target(message: Message, state: FSMContext):
+    try:
+        target = float(message.text.replace(",", "."))
+        if target <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Пришли число больше нуля, например: 300000")
+        return
+    data = await state.get_data()
+    db.create_goal(message.from_user.id, data["goal_name"], target)
+    await state.clear()
+    text, keyboard = _goals_view(message.from_user.id)
+    await message.answer(f"✅ Цель создана.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("goal_add:"))
+async def goal_contribute_start(callback: CallbackQuery, state: FSMContext):
+    goal_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(goal_id=goal_id)
+    await state.set_state(GoalContribute.entering_amount)
+    await callback.message.edit_text("На сколько пополнить цель?")
+    await callback.answer()
+
+
+@router.message(GoalContribute.entering_amount)
+async def goal_contribute_apply(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Пришли число больше нуля.")
+        return
+    data = await state.get_data()
+    db.contribute_to_goal(message.from_user.id, data["goal_id"], amount)
+    await state.clear()
+    goal = db.get_goal_by_id(message.from_user.id, data["goal_id"])
+    text, keyboard = _goals_view(message.from_user.id)
+    prefix = "🎉 Цель достигнута!\n\n" if goal and goal["current_amount"] >= goal["target_amount"] else "✅ Пополнено.\n\n"
+    await message.answer(prefix + text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("goal_del:"))
+async def goal_delete_confirm(callback: CallbackQuery):
+    goal_id = int(callback.data.split(":", 1)[1])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"goal_del_yes:{goal_id}"),
+        InlineKeyboardButton(text="◀️ Отмена", callback_data="goal_del_no"),
+    ]])
+    await callback.message.edit_text("Удалить эту цель вместе с накопленным прогрессом?", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("goal_del_yes:"))
+async def goal_delete_apply(callback: CallbackQuery):
+    goal_id = int(callback.data.split(":", 1)[1])
+    db.delete_goal(callback.from_user.id, goal_id)
+    text, keyboard = _goals_view(callback.from_user.id)
+    await callback.message.edit_text("✅ Удалено.\n\n" + text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "goal_del_no")
+async def goal_delete_cancel(callback: CallbackQuery):
+    text, keyboard = _goals_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Повторяющиеся платежи: /recurring
+# ---------------------------------------------------------------------------
+
+class RecurringEntry(StatesGroup):
+    choosing_type = State()
+    entering_amount = State()
+    choosing_category = State()
+    choosing_payment = State()
+    entering_day = State()
+    entering_description = State()
+
+
+def _recurring_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    items = db.get_recurring_list(user_id)
+    lines = ["🔁 <b>Повторяющиеся платежи</b>", ""]
+    buttons = []
+    if not items:
+        lines.append("Пока не добавлено ни одного.")
+    for r in items:
+        status = "✅" if r["active"] else "⏸"
+        emoji = "💸" if r["type"] == "expense" else "💰"
+        label = r["description"] or r["category_name"] or "без названия"
+        lines.append(f"{status} {emoji} {money(r['amount'])} — {label}, {r['day_of_month']} числа каждый месяц")
+        buttons.append([
+            InlineKeyboardButton(text="⏸/▶️ Вкл/выкл", callback_data=f"rec_toggle:{r['id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"rec_del:{r['id']}"),
+        ])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data="rec_add")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("recurring"))
+async def cmd_recurring(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    text, keyboard = _recurring_view(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "rec_add")
+async def rec_add_start(callback: CallbackQuery, state: FSMContext):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💸 Расход", callback_data="rec_type:expense"),
+        InlineKeyboardButton(text="💰 Доход", callback_data="rec_type:income"),
+    ]])
+    await callback.message.edit_text("Что повторяем?", reply_markup=keyboard)
+    await state.set_state(RecurringEntry.choosing_type)
+    await callback.answer()
+
+
+@router.callback_query(RecurringEntry.choosing_type, F.data.startswith("rec_type:"))
+async def rec_choose_type(callback: CallbackQuery, state: FSMContext):
+    tx_type = callback.data.split(":", 1)[1]
+    await state.update_data(rec_type=tx_type)
+    await state.set_state(RecurringEntry.entering_amount)
+    await callback.message.edit_text("Сумма:")
+    await callback.answer()
+
+
+@router.message(RecurringEntry.entering_amount)
+async def rec_enter_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Пришли число больше нуля.")
+        return
+    await state.update_data(rec_amount=amount)
+    await state.set_state(RecurringEntry.choosing_category)
+    await message.answer("Категория:", reply_markup=categories_keyboard(message.from_user.id, "rec_cat"))
+
+
+@router.callback_query(RecurringEntry.choosing_category, F.data.startswith("rec_cat:"))
+async def rec_choose_category(callback: CallbackQuery, state: FSMContext):
+    cat_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(rec_cat_id=cat_id)
+    await state.set_state(RecurringEntry.choosing_payment)
+    await callback.message.edit_text(
+        "Способ оплаты:", reply_markup=payments_keyboard(callback.from_user.id, "rec_pay")
+    )
+    await callback.answer()
+
+
+@router.callback_query(RecurringEntry.choosing_payment, F.data.startswith("rec_pay:"))
+async def rec_choose_payment(callback: CallbackQuery, state: FSMContext):
+    pm_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(rec_pay_id=pm_id)
+    await state.set_state(RecurringEntry.entering_day)
+    await callback.message.edit_text("Какого числа каждый месяц (1-28)?")
+    await callback.answer()
+
+
+@router.message(RecurringEntry.entering_day)
+async def rec_enter_day(message: Message, state: FSMContext):
+    try:
+        day = int(message.text.strip())
+        if not (1 <= day <= 28):
+            raise ValueError
+    except ValueError:
+        await message.answer("Пришли число от 1 до 28 (чтобы работало для всех месяцев).")
+        return
+    await state.update_data(rec_day=day)
+    await state.set_state(RecurringEntry.entering_description)
+    await message.answer("Название платежа (например: Аренда квартиры):")
+
+
+@router.message(RecurringEntry.entering_description)
+async def rec_enter_description(message: Message, state: FSMContext):
+    data = await state.get_data()
+    db.add_recurring(
+        user_id=message.from_user.id,
+        tx_type=data["rec_type"],
+        amount=data["rec_amount"],
+        category_id=data["rec_cat_id"],
+        payment_method_id=data["rec_pay_id"],
+        description=message.text.strip(),
+        day_of_month=data["rec_day"],
+    )
+    await state.clear()
+    text, keyboard = _recurring_view(message.from_user.id)
+    await message.answer(f"✅ Повторяющийся платёж добавлен.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("rec_toggle:"))
+async def rec_toggle(callback: CallbackQuery):
+    rec_id = int(callback.data.split(":", 1)[1])
+    db.toggle_recurring_active(callback.from_user.id, rec_id)
+    text, keyboard = _recurring_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rec_del:"))
+async def rec_delete(callback: CallbackQuery):
+    rec_id = int(callback.data.split(":", 1)[1])
+    db.delete_recurring(callback.from_user.id, rec_id)
+    text, keyboard = _recurring_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer("Удалено")
+
+
+async def _recurring_scheduler(bot: Bot):
+    """Раз в несколько часов проверяет все активные повторяющиеся платежи и
+    создаёт транзакцию, если наступил день месяца и в этом месяце ещё не срабатывал."""
+    while True:
+        today = date.today()
+        for r in db.get_all_active_recurring():
+            last_run = date.fromisoformat(r["last_run_date"]) if r["last_run_date"] else None
+            already_ran_this_month = last_run and (last_run.year, last_run.month) == (today.year, today.month)
+            if today.day >= r["day_of_month"] and not already_ran_this_month:
+                db.add_transaction(
+                    user_id=r["user_id"],
+                    tx_type=r["type"],
+                    amount=r["amount"],
+                    category_id=r["category_id"],
+                    payment_method_id=r["payment_method_id"],
+                    store=None,
+                    description=r["description"],
+                    op_date=today.isoformat(),
+                )
+                db.mark_recurring_run(r["id"], today.isoformat())
+                emoji = "💰" if r["type"] == "income" else "💸"
+                try:
+                    await bot.send_message(
+                        r["user_id"],
+                        f"🔁 Автоматически добавлено: {emoji} {money(r['amount'])} — {r['description'] or ''}",
+                    )
+                except Exception:
+                    logger.exception("Не удалось уведомить пользователя о повторяющемся платеже")
+        await asyncio.sleep(6 * 3600)
+
+
+# ---------------------------------------------------------------------------
+# Аналитика по категории: /category_stats
+# ---------------------------------------------------------------------------
+
+def _catstat_period_keyboard(cat_id: int) -> InlineKeyboardMarkup:
+    labels = [("Сегодня", "day"), ("Неделя", "week"), ("Месяц", "month"), ("3 месяца", "3months"), ("Год", "year")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=text, callback_data=f"catstat_period:{cat_id}:{period}")]
+        for text, period in labels
+    ])
+
+
+@router.message(Command("category_stats"))
+async def cmd_category_stats(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    keyboard = categories_keyboard(message.from_user.id, "catstat_pick")
+    await message.answer("По какой категории посмотреть статистику?", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("catstat_pick:"))
+async def catstat_pick_category(callback: CallbackQuery):
+    cat_id = int(callback.data.split(":", 1)[1])
+    await callback.message.edit_text("За какой период?", reply_markup=_catstat_period_keyboard(cat_id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("catstat_period:"))
+async def catstat_show(callback: CallbackQuery):
+    _, cat_id_str, period = callback.data.split(":")
+    cat_id = int(cat_id_str)
+    user_id = callback.from_user.id
+
+    date_from, date_to, label = _period_bounds(period)
+    spent = db.get_category_spent(user_id, cat_id, date_from, date_to)
+    total = db.get_total_expense(user_id, date_from, date_to)
+    pct_of_total = (spent / total * 100) if total > 0 else 0
+
+    prev_from, prev_to = _previous_period_bounds(date_from, date_to)
+    prev_spent = db.get_category_spent(user_id, cat_id, prev_from, prev_to)
+
+    cat_name = db.get_category_name(user_id, cat_id) or "?"
+    text = (
+        f"🔍 <b>{cat_name}</b> — {label}\n"
+        f"Период: {date_from} — {date_to}\n\n"
+        f"Потрачено: {money(spent)}\n"
+        f"Доля от всех расходов за период: {pct_of_total:.0f}%\n"
+        f"К прошлому периоду: {_pct_change(spent, prev_spent)} (было {money(prev_spent)})"
+    )
+    await callback.message.edit_text(text)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
+
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "Не задан BOT_TOKEN. Установи переменную окружения BOT_TOKEN "
+            "с токеном, полученным у @BotFather."
+        )
+
+    db.init_db()
+
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    asyncio.create_task(_recurring_scheduler(bot))
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
