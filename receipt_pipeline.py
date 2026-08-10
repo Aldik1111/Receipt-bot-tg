@@ -8,7 +8,7 @@
 
 import logging
 
-from categorizer import categorize
+from categorizer import categorize_smart
 from gemini_engine import get_receipt_from_gemini
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ EMPTY_RECEIPT = {
 }
 
 
-def extract_receipt(image_path: str) -> dict:
+def extract_receipt(image_path: str, user_id: int) -> dict:
     try:
         result = get_receipt_from_gemini(image_path)
     except Exception:
@@ -33,15 +33,15 @@ def extract_receipt(image_path: str) -> dict:
 
     if result and result.get("items"):
         logger.info("Чек распознан через Gemini")
-        _categorize_items(result)
+        _categorize_items(result, user_id)
         return result
 
     logger.info("Gemini не смог распознать чек")
     return dict(EMPTY_RECEIPT)
 
 
-def _categorize_items(parsed: dict) -> None:
-    """Категоризация по ключевым словам - Gemini сам товары не категоризирует,
-    этим занимается наш локальный словарь (бесплатно, без лишнего вызова API)."""
+def _categorize_items(parsed: dict, user_id: int) -> None:
+    """Категоризация каждого товара: сначала выученные слова пользователя,
+    потом локальный словарь, и только если оба не справились - ИИ-резерв."""
     for item in parsed["items"]:
-        item.setdefault("category", categorize(item["name"]))
+        item.setdefault("category", categorize_smart(user_id, item["name"]))

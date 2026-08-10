@@ -31,6 +31,12 @@ def get_conn():
         conn.close()
 
 
+def _ensure_column(conn, table: str, column: str, add_sql: str) -> None:
+    cols = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {add_sql}")
+
+
 def init_db():
     with get_conn() as conn:
         conn.executescript(
@@ -127,8 +133,21 @@ def init_db():
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS learned_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                keyword TEXT NOT NULL,
+                category_id INTEGER NOT NULL,
+                UNIQUE(user_id, keyword),
+                FOREIGN KEY(user_id) REFERENCES users(user_id),
+                FOREIGN KEY(category_id) REFERENCES categories(id)
+            );
             """
         )
+        _ensure_column(conn, "users", "language", "language TEXT NOT NULL DEFAULT 'ru'")
+        _ensure_column(conn, "users", "digest_frequency", "digest_frequency TEXT NOT NULL DEFAULT 'off'")
+        _ensure_column(conn, "users", "digest_last_sent", "digest_last_sent TEXT")
 
 
 def ensure_user(user_id: int, username: str | None):
@@ -660,5 +679,68 @@ def get_category_name(user_id: int, category_id: int) -> str | None:
     with get_conn() as conn:
         row = conn.execute(
             "SELECT name FROM categories WHERE id=? AND user_id=?", (category_id, user_id)
+        ).fetchone()
+        return row["name"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Язык и настройка автосводки
+# ---------------------------------------------------------------------------
+
+def get_user_language(user_id: int) -> str:
+    with get_conn() as conn:
+        row = conn.execute("SELECT language FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return row["language"] if row and row["language"] else "ru"
+
+
+def set_user_language(user_id: int, lang: str) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET language=? WHERE user_id=?", (lang, user_id))
+
+
+def get_digest_frequency(user_id: int) -> str:
+    with get_conn() as conn:
+        row = conn.execute("SELECT digest_frequency FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return row["digest_frequency"] if row and row["digest_frequency"] else "off"
+
+
+def set_digest_frequency(user_id: int, freq: str) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET digest_frequency=? WHERE user_id=?", (freq, user_id))
+
+
+def get_users_for_digest() -> list[sqlite3.Row]:
+    """Все пользователи, у кого автосводка включена (не 'off')."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT user_id, digest_frequency, digest_last_sent FROM users WHERE digest_frequency != 'off'"
+        ).fetchall()
+
+
+def mark_digest_sent(user_id: int, sent_date: str) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET digest_last_sent=? WHERE user_id=?", (sent_date, user_id))
+
+
+# ---------------------------------------------------------------------------
+# Обучение категоризации (запоминание слово -> категория)
+# ---------------------------------------------------------------------------
+
+def learn_category(user_id: int, keyword: str, category_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO learned_categories(user_id, keyword, category_id) VALUES (?,?,?)
+               ON CONFLICT(user_id, keyword) DO UPDATE SET category_id=excluded.category_id""",
+            (user_id, keyword.strip().lower(), category_id),
+        )
+
+
+def get_learned_category_name(user_id: int, keyword: str) -> str | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT c.name FROM learned_categories lc
+               JOIN categories c ON c.id = lc.category_id
+               WHERE lc.user_id=? AND lc.keyword=?""",
+            (user_id, keyword.strip().lower()),
         ).fetchone()
         return row["name"] if row else None

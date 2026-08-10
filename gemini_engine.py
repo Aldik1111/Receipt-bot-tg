@@ -112,3 +112,51 @@ def get_receipt_from_gemini(image_path: str) -> dict | None:
         "raw_text": f"[распознано Gemini {GEMINI_MODEL}]",
         "source": "gemini",
     }
+
+
+def _text_request(prompt: str, max_tokens: int = 200) -> str | None:
+    """Общая обёртка для текстовых (не по фото) запросов к Gemini."""
+    if not GEMINI_API_KEY:
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
+    }
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+        if not response.ok:
+            logger.error("Gemini text API вернул %s: %s", response.status_code, response.text[:300])
+            return None
+        payload = response.json()
+        return payload["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception:
+        logger.exception("Ошибка текстового запроса к Gemini")
+        return None
+
+
+def guess_category_ai(item_name: str, category_names: list[str]) -> str | None:
+    """Вызывается ТОЛЬКО когда локальный словарь категорий не справился
+    (вернул "Прочее") - последний резерв перед тем как сдаться окончательно."""
+    prompt = (
+        f"Товар: \"{item_name}\"\n"
+        f"Выбери ОДНУ наиболее подходящую категорию строго из списка "
+        f"(ответь только названием категории, без пояснений):\n"
+        f"{', '.join(category_names)}"
+    )
+    result = _text_request(prompt, max_tokens=20)
+    return result.strip() if result else None
+
+
+def generate_insight_text(summary: dict, lang: str = "ru") -> str | None:
+    """Короткий человеческий вывод по статистике для автосводки/дайджеста."""
+    lang_names = {"ru": "русском", "kk": "казахском", "en": "английском"}
+    prompt = (
+        f"Вот сводка расходов пользователя бюджетного бота за период:\n"
+        f"{summary}\n\n"
+        f"Напиши 1-2 коротких предложения с наблюдением или советом на "
+        f"{lang_names.get(lang, 'русском')} языке - по-дружески, без канцелярита, "
+        f"без markdown-разметки, без вступлений вида 'вот наблюдение'."
+    )
+    return _text_request(prompt, max_tokens=150)

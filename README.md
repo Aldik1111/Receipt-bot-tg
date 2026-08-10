@@ -256,7 +256,7 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now receipt-webapp
+sudo systemctl ensudo systemctl status receipt-botable --now receipt-webapp
 ```
 
 3. Caddyfile (см. пример выше в разделе про хостинг) проксирует `/api/*` на

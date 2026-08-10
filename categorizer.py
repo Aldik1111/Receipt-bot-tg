@@ -33,6 +33,39 @@ def categorize(item_name: str, categories_keywords: dict[str, list[str]] | None 
     return best_category
 
 
+def categorize_smart(user_id: int, item_name: str) -> str:
+    """Три уровня, по порядку:
+    1) Слово уже было один раз исправлено пользователем вручную - используем
+       запомненную категорию (быстро, бесплатно, 100% предсказуемо).
+    2) Локальный словарь ключевых слов (быстро, бесплатно).
+    3) Только если словарь не справился (результат - "Прочее") - спрашиваем
+       ИИ (Gemini), и если он дал уверенный ответ, ЗАПОМИНАЕМ его как выученное
+       слово, чтобы в следующий раз не тратить время/запрос на тот же товар.
+    """
+    import db
+    from gemini_engine import guess_category_ai
+
+    normalized = item_name.strip().lower()
+
+    learned = db.get_learned_category_name(user_id, normalized)
+    if learned:
+        return learned
+
+    result = categorize(item_name)
+    if result != "Прочее":
+        return result
+
+    category_names = [c["name"] for c in db.get_categories(user_id)]
+    ai_guess = guess_category_ai(item_name, category_names)
+    if ai_guess and ai_guess in category_names:
+        cat_id = db.get_category_id_by_name(user_id, ai_guess)
+        if cat_id:
+            db.learn_category(user_id, normalized, cat_id)
+        return ai_guess
+
+    return "Прочее"
+
+
 if __name__ == "__main__":
     # Быстрый самотест
     tests = [

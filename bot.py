@@ -23,9 +23,12 @@ from aiogram.types import (
 
 import db
 import charts
-from categorizer import categorize
+import export
+from categorizer import categorize, categorize_smart
 from config import BOT_TOKEN
 from formatting import money
+from gemini_engine import generate_insight_text
+from i18n import LANGUAGES, t
 from receipt_pipeline import extract_receipt
 
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +42,10 @@ router = Router()
 # одного процесса обычного словаря в памяти достаточно)
 # ---------------------------------------------------------------------------
 PENDING_RECEIPTS: dict[str, dict] = {}
+
+# id созданных транзакций по каждому сохранённому чеку - чтобы можно было
+# открыть их для правки одним тапом через уже готовый редактор операций
+RECEIPT_ITEM_IDS: dict[int, list[int]] = {}
 
 
 class ManualEntry(StatesGroup):
@@ -90,11 +97,12 @@ def _with_back_button(keyboard: InlineKeyboardMarkup, back_callback: str) -> Inl
 
 def period_keyboard() -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="Сегодня", callback_data="stats:day")],
-        [InlineKeyboardButton(text="Неделя", callback_data="stats:week")],
-        [InlineKeyboardButton(text="Месяц", callback_data="stats:month")],
-        [InlineKeyboardButton(text="3 месяца", callback_data="stats:3months")],
+        [InlineKeyboardButton(text="Сегодня", callback_data="stats:day"),
+         InlineKeyboardButton(text="Неделя", callback_data="stats:week")],
+        [InlineKeyboardButton(text="Месяц", callback_data="stats:month"),
+         InlineKeyboardButton(text="3 месяца", callback_data="stats:3months")],
         [InlineKeyboardButton(text="Год", callback_data="stats:year")],
+        [InlineKeyboardButton(text="📅 Свой период", callback_data="stats_custom")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -103,38 +111,17 @@ def period_keyboard() -> InlineKeyboardMarkup:
 # /start
 # ---------------------------------------------------------------------------
 
-HELP_TEXT = (
-    "🤖 <b>Что я умею</b>\n\n"
-    "⚡️ <b>Быстрый ввод</b> - напиши сообщением сумму и что купил:\n"
-    "<code>500 такси</code> - расход, <code>+50000 зарплата</code> - доход.\n"
-    "Категория подбирается автоматически, поправить можно кнопкой под сообщением.\n\n"
-    "📸 <b>Фото чека</b> - пришли фото, я распознаю магазин, товары, цены и разложу "
-    "по категориям. Если распознаётся плохо - пришли чек как ФАЙЛ (📎 → Файл), "
-    "так Telegram не сжимает изображение.\n\n"
-    "➕ /add - пошаговое добавление операции с полным контролем над категорией и оплатой\n"
-    "📋 /recent - список последних операций: можно поправить сумму, категорию, "
-    "оплату, описание или удалить\n"
-    "📊 /stats - статистика за период: расходы/доходы, по категориям, топ мест трат, "
-    "по способам оплаты, динамика по времени\n"
-    "🏷 /categories - свои категории: добавить, переименовать, удалить\n"
-    "💳 /payments - способы оплаты: добавить, переименовать, удалить\n"
-    "💰 /budget - лимиты по категориям на месяц, с предупреждением при приближении\n"
-    "🎯 /goals - накопительные цели с прогресс-баром\n"
-    "🔁 /recurring - повторяющиеся платежи (аренда, подписки) - добавляются сами каждый месяц\n"
-    "🔍 /category_stats - подробная аналитика по одной категории за период\n"
-    "❓ /help - это сообщение"
-)
-
-
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     db.ensure_user(message.from_user.id, message.from_user.username)
-    await message.answer("Привет! Я твой бюджетный менеджер.\n\n" + HELP_TEXT)
+    lang = db.get_user_language(message.from_user.id)
+    await message.answer(t("start_greeting", lang) + t("help_text", lang))
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(HELP_TEXT)
+    lang = db.get_user_language(message.from_user.id)
+    await message.answer(t("help_text", lang))
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +156,7 @@ async def _process_receipt(message: Message, bot: Bot, file_id: str, unique_id: 
     await bot.download_file(file.file_path, destination=local_path)
 
     try:
-        parsed = extract_receipt(local_path)
+        parsed = extract_receipt(local_path, message.from_user.id)
     except Exception:
         logger.exception("Receipt extraction error")
         await status.edit_text(
@@ -258,10 +245,11 @@ async def confirm_receipt_save(callback: CallbackQuery):
     )
 
     touched_categories = set()
+    created_tx_ids = []
     for item in parsed["items"]:
         cat_id = db.get_category_id_by_name(user_id, item["category"])
         touched_categories.add(cat_id)
-        db.add_transaction(
+        tx_id = db.add_transaction(
             user_id=user_id,
             tx_type="expense",
             amount=item["price"],
@@ -273,15 +261,43 @@ async def confirm_receipt_save(callback: CallbackQuery):
             op_time=parsed["time"],
             receipt_id=receipt_id,
         )
+        created_tx_ids.append(tx_id)
 
+    RECEIPT_ITEM_IDS[receipt_id] = created_tx_ids
+    edit_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="📝 Позиции чека (поправить)", callback_data=f"recv_items:{receipt_id}"
+    )]])
     await callback.message.edit_text(
-        callback.message.text + "\n\n✅ Сохранено в базу!", reply_markup=None
+        callback.message.text + "\n\n✅ Сохранено в базу!", reply_markup=edit_kb
     )
     for cat_id in touched_categories:
         warning = await _budget_warning_text(user_id, cat_id)
         if warning:
             await callback.message.answer(warning)
     await callback.answer("Сохранено")
+
+
+@router.callback_query(F.data.startswith("recv_items:"))
+async def show_receipt_items(callback: CallbackQuery):
+    receipt_id = int(callback.data.split(":", 1)[1])
+    tx_ids = RECEIPT_ITEM_IDS.get(receipt_id, [])
+    user_id = callback.from_user.id
+
+    buttons = []
+    lines = ["🧾 <b>Позиции чека</b>\n"]
+    for tx_id in tx_ids:
+        tx = db.get_transaction_by_id(user_id, tx_id)
+        if not tx:
+            continue
+        lines.append(f"• {tx['description']} — {money(tx['amount'])} [{tx['category_name'] or '—'}]")
+        buttons.append([InlineKeyboardButton(
+            text=f"✏️ {tx['description']}"[:60], callback_data=f"tx_open:{tx_id}"
+        )])
+    if not buttons:
+        await callback.answer("Позиции не найдены", show_alert=True)
+        return
+    await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("recv_cancel:"))
@@ -457,12 +473,7 @@ RU_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 RU_MONTHS = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
 
 
-@router.callback_query(F.data.startswith("stats:"))
-async def show_stats(callback: CallbackQuery):
-    period = callback.data.split(":", 1)[1]
-    date_from, date_to, label = _period_bounds(period)
-    user_id = callback.from_user.id
-
+async def _send_stats(message: Message, user_id: int, date_from: str, date_to: str, label: str):
     rows = db.get_transactions(user_id, date_from, date_to)
     expenses = [dict(r) for r in rows if r["type"] == "expense"]
     incomes = [dict(r) for r in rows if r["type"] == "income"]
@@ -483,15 +494,14 @@ async def show_stats(callback: CallbackQuery):
     show_list_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
         text="📋 Показать операции", callback_data=f"recent_from:{date_from}:{date_to}"
     )]])
-    await callback.message.answer(summary, reply_markup=show_list_kb)
+    await message.answer(summary, reply_markup=show_list_kb)
 
     if not expenses:
-        await callback.message.answer("Расходов за этот период нет.")
-        await callback.answer()
+        await message.answer("Расходов за этот период нет.")
         return
 
     buf = charts.pie_chart_by_category(expenses, f"Расходы {label}")
-    await callback.message.answer_photo(BufferedInputFile(buf.read(), filename="by_category.png"))
+    await message.answer_photo(BufferedInputFile(buf.read(), filename="by_category.png"))
 
     # Куда - топ магазинов/мест
     store_totals: dict[str, float] = defaultdict(float)
@@ -503,7 +513,7 @@ async def show_stats(callback: CallbackQuery):
         lines = ["📍 <b>Топ мест трат</b>"]
         for name, amount in top_stores:
             lines.append(f"• {name} — {money(amount)}")
-        await callback.message.answer("\n".join(lines))
+        await message.answer("\n".join(lines))
 
     # Способы оплаты
     pay_totals: dict[str, float] = defaultdict(float)
@@ -513,27 +523,64 @@ async def show_stats(callback: CallbackQuery):
         lines = ["💳 <b>По способам оплаты</b>"]
         for name, amount in sorted(pay_totals.items(), key=lambda kv: kv[1], reverse=True):
             lines.append(f"• {name} — {money(amount)}")
-        await callback.message.answer("\n".join(lines))
+        await message.answer("\n".join(lines))
 
-    # Когда - тренд трат по времени (не строим для одного дня - смысла мало)
-    if period != "day":
+    # Когда - тренд трат по времени (не строим, если период короче 2 дней - смысла мало)
+    span_days = (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days + 1
+    if span_days > 1:
         buckets: dict[str, float] = {}
         for e in expenses:
             d = date.fromisoformat(e["op_date"])
-            if period == "week":
+            if span_days <= 31:
                 key = f"{RU_WEEKDAYS[d.weekday()]} {d.day:02d}"
-            elif period == "month":
-                key = f"{d.day:02d}.{d.month:02d}"
-            elif period == "3months":
+            elif span_days <= 120:
                 key = f"Нед.{d.isocalendar()[1]}"
-            else:  # year
+            else:
                 key = RU_MONTHS[d.month - 1]
             buckets[key] = buckets.get(key, 0) + e["amount"]
         if len(buckets) > 1:
             buf2 = charts.bar_chart_by_period(buckets, f"Динамика трат {label}")
-            await callback.message.answer_photo(BufferedInputFile(buf2.read(), filename="trend.png"))
+            await message.answer_photo(BufferedInputFile(buf2.read(), filename="trend.png"))
 
+
+@router.callback_query(F.data.startswith("stats:"))
+async def show_stats(callback: CallbackQuery):
+    period = callback.data.split(":", 1)[1]
+    date_from, date_to, label = _period_bounds(period)
+    await _send_stats(callback.message, callback.from_user.id, date_from, date_to, label)
     await callback.answer()
+
+
+class StatsCustomPeriod(StatesGroup):
+    entering_dates = State()
+
+
+@router.callback_query(F.data == "stats_custom")
+async def stats_custom_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(StatsCustomPeriod.entering_dates)
+    await callback.message.edit_text(
+        "Введи период в формате <code>ДД.ММ.ГГГГ ДД.ММ.ГГГГ</code>\n"
+        "Например: <code>01.03.2026 15.03.2026</code>"
+    )
+    await callback.answer()
+
+
+@router.message(StatsCustomPeriod.entering_dates)
+async def stats_custom_apply(message: Message, state: FSMContext):
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Нужно два числа через пробел, например: 01.03.2026 15.03.2026")
+        return
+    try:
+        d_from = datetime.strptime(parts[0], "%d.%m.%Y").date()
+        d_to = datetime.strptime(parts[1], "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Не разобрал даты. Формат: ДД.ММ.ГГГГ ДД.ММ.ГГГГ")
+        return
+    if d_from > d_to:
+        d_from, d_to = d_to, d_from
+    await state.clear()
+    await _send_stats(message, message.from_user.id, d_from.isoformat(), d_to.isoformat(), "за выбранный период")
 
 
 @router.callback_query(F.data.startswith("recent_from:"))
@@ -810,7 +857,7 @@ async def quick_add(message: Message, state: FSMContext):
         return
 
     description = description_raw.strip() or None
-    category_name = categorize(description) if description else "Прочее"
+    category_name = await asyncio.to_thread(categorize_smart, message.from_user.id, description) if description else "Прочее"
     category_id = db.get_category_id_by_name(message.from_user.id, category_name)
     payment_method_id = db.get_default_payment_method_id(message.from_user.id)
 
@@ -1031,9 +1078,17 @@ async def tx_edit_category_start(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("tx_setcat:"))
 async def tx_edit_category_apply(callback: CallbackQuery):
     _, tx_id, cat_id = callback.data.split(":")
-    db.update_transaction_category(callback.from_user.id, int(tx_id), int(cat_id))
-    text, keyboard = _tx_detail_view(callback.from_user.id, int(tx_id))
-    await callback.message.edit_text(f"✅ Категория обновлена.\n\n{text}", reply_markup=keyboard)
+    user_id = callback.from_user.id
+    db.update_transaction_category(user_id, int(tx_id), int(cat_id))
+
+    # Запоминаем: то же самое описание/товар в следующий раз сразу пойдёт
+    # в эту категорию, без словаря и без ИИ
+    tx = db.get_transaction_by_id(user_id, int(tx_id))
+    if tx and tx["description"]:
+        db.learn_category(user_id, tx["description"], int(cat_id))
+
+    text, keyboard = _tx_detail_view(user_id, int(tx_id))
+    await callback.message.edit_text(f"✅ Категория обновлена (запомнил на будущее).\n\n{text}", reply_markup=keyboard)
     await callback.answer()
 
 
@@ -1514,6 +1569,173 @@ async def catstat_show(callback: CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
+# Экспорт операций: /export
+# ---------------------------------------------------------------------------
+
+class ExportState(StatesGroup):
+    choosing_format = State()
+
+
+@router.message(Command("export"))
+async def cmd_export(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Месяц", callback_data="exp_period:month"),
+         InlineKeyboardButton(text="3 месяца", callback_data="exp_period:3months")],
+        [InlineKeyboardButton(text="Год", callback_data="exp_period:year"),
+         InlineKeyboardButton(text="Всё время", callback_data="exp_period:all")],
+    ])
+    await message.answer("За какой период выгрузить операции?", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("exp_period:"))
+async def export_choose_format(callback: CallbackQuery, state: FSMContext):
+    period = callback.data.split(":", 1)[1]
+    await state.update_data(export_period=period)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="CSV", callback_data="exp_format:csv"),
+        InlineKeyboardButton(text="Excel", callback_data="exp_format:xlsx"),
+    ]])
+    await callback.message.edit_text("В каком формате?", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("exp_format:"))
+async def export_generate(callback: CallbackQuery, state: FSMContext):
+    fmt = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    period = data.get("export_period", "month")
+    user_id = callback.from_user.id
+
+    if period == "all":
+        date_from, date_to = "2000-01-01", date.today().isoformat()
+    else:
+        date_from, date_to, _ = _period_bounds(period)
+
+    rows = [dict(r) for r in db.get_transactions(user_id, date_from, date_to)]
+    await state.clear()
+
+    if not rows:
+        await callback.message.edit_text("За этот период операций нет - нечего выгружать.")
+        await callback.answer()
+        return
+
+    if fmt == "csv":
+        buf = export.export_csv(rows)
+        filename = f"operations_{date_from}_{date_to}.csv"
+    else:
+        buf = export.export_xlsx(rows)
+        filename = f"operations_{date_from}_{date_to}.xlsx"
+
+    await callback.message.edit_text(f"Готово, {len(rows)} операций 👇")
+    await callback.message.answer_document(BufferedInputFile(buf.read(), filename=filename))
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Язык интерфейса: /language
+# ---------------------------------------------------------------------------
+
+@router.message(Command("language"))
+async def cmd_language(message: Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=name, callback_data=f"lang:{code}")]
+        for code, name in LANGUAGES.items()
+    ])
+    await message.answer(t("language_prompt", db.get_user_language(message.from_user.id)), reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("lang:"))
+async def set_language(callback: CallbackQuery):
+    lang = callback.data.split(":", 1)[1]
+    db.set_user_language(callback.from_user.id, lang)
+    await callback.message.edit_text(t("language_set", lang))
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Автосводка + AI-инсайт по расписанию: /digest
+# ---------------------------------------------------------------------------
+
+DIGEST_FREQ_LABELS = {"off": "digest_off", "day": "digest_day", "week": "digest_week",
+                       "month": "digest_month", "year": "digest_year"}
+
+
+@router.message(Command("digest"))
+async def cmd_digest(message: Message):
+    lang = db.get_user_language(message.from_user.id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t(key, lang), callback_data=f"digest_freq:{freq}")]
+        for freq, key in DIGEST_FREQ_LABELS.items()
+    ])
+    await message.answer(t("digest_prompt", lang), reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("digest_freq:"))
+async def set_digest_freq(callback: CallbackQuery):
+    freq = callback.data.split(":", 1)[1]
+    lang = db.get_user_language(callback.from_user.id)
+    db.set_digest_frequency(callback.from_user.id, freq)
+    await callback.message.edit_text(t("digest_set", lang, freq=t(DIGEST_FREQ_LABELS[freq], lang)))
+    await callback.answer()
+
+
+def _digest_due(freq: str, last_sent: str | None, today: date) -> bool:
+    if freq == "off":
+        return False
+    if not last_sent:
+        return True
+    last = date.fromisoformat(last_sent)
+    if freq == "day":
+        return last != today
+    if freq == "week":
+        return (today - last).days >= 7
+    if freq == "month":
+        return (last.year, last.month) != (today.year, today.month)
+    if freq == "year":
+        return last.year != today.year
+    return False
+
+
+async def _digest_scheduler(bot: Bot):
+    """Раз в несколько часов проверяет, кому пора прислать автосводку со
+    статистикой за месяц и коротким AI-наблюдением."""
+    while True:
+        today = date.today()
+        for row in db.get_users_for_digest():
+            if not _digest_due(row["digest_frequency"], row["digest_last_sent"], today):
+                continue
+            user_id = row["user_id"]
+            try:
+                lang = db.get_user_language(user_id)
+                date_from, date_to, label = _period_bounds("month")
+                total_expense = db.get_total_expense(user_id, date_from, date_to)
+                categories_rows = [dict(r) for r in db.get_transactions(user_id, date_from, date_to) if r["type"] == "expense"]
+                cat_totals: dict[str, float] = defaultdict(float)
+                for r in categories_rows:
+                    cat_totals[r["category_name"] or "Без категории"] += r["amount"]
+                top = sorted(cat_totals.items(), key=lambda kv: kv[1], reverse=True)[:3]
+
+                text = f"🔔 <b>{t('stats_title', lang, label=label)}</b>\n{t('expenses', lang)}: {money(total_expense)}"
+                if top:
+                    text += "\n\n" + "\n".join(f"• {name}: {money(amount)}" for name, amount in top)
+
+                insight = await asyncio.to_thread(
+                    generate_insight_text,
+                    {"total_expense": total_expense, "top_categories": top},
+                    lang,
+                )
+                if insight:
+                    text += f"\n\n💡 {insight}"
+
+                await bot.send_message(user_id, text)
+                db.mark_digest_sent(user_id, today.isoformat())
+            except Exception:
+                logger.exception("Не удалось отправить дайджест пользователю %s", user_id)
+        await asyncio.sleep(6 * 3600)
+
+
+# ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
 
@@ -1531,6 +1753,7 @@ async def main():
     dp.include_router(router)
 
     asyncio.create_task(_recurring_scheduler(bot))
+    asyncio.create_task(_digest_scheduler(bot))
     await dp.start_polling(bot)
 
 
