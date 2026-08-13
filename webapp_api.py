@@ -44,6 +44,19 @@ def _period_bounds(period: str) -> tuple[str, str]:
     return start.isoformat(), today.isoformat()
 
 
+@routes.get("/health")
+async def health_check(request: web.Request) -> web.Response:
+    """Для внешнего мониторинга (UptimeRobot и т.п.) - без авторизации,
+    т.к. внешний сторож не умеет подписывать Telegram initData. Отдаёт 200
+    только если реально можем достучаться до базы, а не просто "процесс жив"."""
+    try:
+        db.count_all_transactions(0)  # лёгкий запрос, user_id=0 никогда не существует
+        return web.json_response({"status": "ok"})
+    except Exception:
+        logger.exception("Health check: БД недоступна")
+        return web.json_response({"status": "error"}, status=500)
+
+
 @routes.get("/api/summary")
 async def get_summary(request: web.Request) -> web.Response:
     user_id = _authenticate(request)

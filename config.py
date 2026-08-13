@@ -82,3 +82,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # зашитого "gemini-2.5-flash", который в какой-то момент может быть снят с
 # поддержки). Полный список: https://ai.google.dev/gemini-api/docs/models
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+
+# Твой Telegram user_id - сюда будет приходить фидбэк от /feedback.
+# Узнать свой id можно у бота @userinfobot.
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0")) or None

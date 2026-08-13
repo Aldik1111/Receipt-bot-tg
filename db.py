@@ -206,6 +206,14 @@ def get_category_id_by_name(user_id: int, name: str) -> int | None:
         return row["id"] if row else None
 
 
+def get_payment_method_id_by_name(user_id: int, name: str) -> int | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM payment_methods WHERE user_id=? AND name=?", (user_id, name)
+        ).fetchone()
+        return row["id"] if row else None
+
+
 def get_payment_methods(user_id: int) -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(

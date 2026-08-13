@@ -28,7 +28,7 @@ import db
 import charts
 import export
 from categorizer import categorize, categorize_smart
-from config import BOT_TOKEN
+from config import ADMIN_USER_ID, BOT_TOKEN
 from formatting import money
 from gemini_engine import generate_insight_text
 from i18n import LANGUAGES, t
@@ -2074,6 +2074,41 @@ async def _backup_scheduler(bot: Bot):
             except Exception:
                 logger.exception("Не удалось отправить автобэкап пользователю %s", user_id)
         await asyncio.sleep(24 * 3600)
+
+
+# ---------------------------------------------------------------------------
+# Обратная связь: /feedback
+# ---------------------------------------------------------------------------
+
+class FeedbackEntry(StatesGroup):
+    entering_text = State()
+
+
+@router.message(Command("feedback"))
+async def cmd_feedback(message: Message, state: FSMContext):
+    if not ADMIN_USER_ID:
+        await message.answer("Обратная связь пока не настроена разработчиком.")
+        return
+    await state.set_state(FeedbackEntry.entering_text)
+    await message.answer(
+        "Напиши сообщение - баг, идею, что угодно. Я перешлю разработчику напрямую."
+    )
+
+
+@router.message(FeedbackEntry.entering_text)
+async def feedback_send(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    user = message.from_user
+    username = f"@{user.username}" if user.username else user.full_name
+    try:
+        await bot.send_message(
+            ADMIN_USER_ID,
+            f"📩 <b>Фидбэк от {username}</b> (id {user.id}):\n\n{message.text}",
+        )
+        await message.answer("✅ Отправлено, спасибо!")
+    except Exception:
+        logger.exception("Не удалось переслать фидбэк админу")
+        await message.answer("⚠️ Не получилось отправить, попробуй ещё раз позже.")
 
 
 # ---------------------------------------------------------------------------
