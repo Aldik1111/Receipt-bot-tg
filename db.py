@@ -16,7 +16,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
-from config import DB_PATH, DEFAULT_CATEGORIES, DEFAULT_PAYMENT_METHODS
+from config import DB_PATH, DEFAULT_CATEGORIES, DEFAULT_CATEGORY_EMOJIS, DEFAULT_PAYMENT_METHODS
 
 
 @contextmanager
@@ -148,6 +148,12 @@ def init_db():
         _ensure_column(conn, "users", "language", "language TEXT NOT NULL DEFAULT 'ru'")
         _ensure_column(conn, "users", "digest_frequency", "digest_frequency TEXT NOT NULL DEFAULT 'off'")
         _ensure_column(conn, "users", "digest_last_sent", "digest_last_sent TEXT")
+        _ensure_column(conn, "users", "bank_import_enabled", "bank_import_enabled INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "users", "idle_reminder_enabled", "idle_reminder_enabled INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "users", "last_activity_date", "last_activity_date TEXT")
+        _ensure_column(conn, "users", "idle_reminder_last_sent", "idle_reminder_last_sent TEXT")
+        _ensure_column(conn, "users", "backup_last_sent", "backup_last_sent TEXT")
+        _ensure_column(conn, "categories", "emoji", "emoji TEXT NOT NULL DEFAULT '🏷'")
 
 
 def ensure_user(user_id: int, username: str | None):
@@ -161,9 +167,10 @@ def ensure_user(user_id: int, username: str | None):
             (user_id, username, datetime.utcnow().isoformat()),
         )
         for cat_name in DEFAULT_CATEGORIES.keys():
+            emoji = DEFAULT_CATEGORY_EMOJIS.get(cat_name, "🏷")
             conn.execute(
-                "INSERT OR IGNORE INTO categories(user_id, name) VALUES (?,?)",
-                (user_id, cat_name),
+                "INSERT OR IGNORE INTO categories(user_id, name, emoji) VALUES (?,?,?)",
+                (user_id, cat_name, emoji),
             )
         for pm_name in DEFAULT_PAYMENT_METHODS:
             conn.execute(
@@ -179,11 +186,11 @@ def get_categories(user_id: int) -> list[sqlite3.Row]:
         ).fetchall()
 
 
-def add_category(user_id: int, name: str) -> int:
+def add_category(user_id: int, name: str, emoji: str = "🏷") -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT OR IGNORE INTO categories(user_id, name) VALUES (?,?)",
-            (user_id, name),
+            "INSERT OR IGNORE INTO categories(user_id, name, emoji) VALUES (?,?,?)",
+            (user_id, name, emoji),
         )
         row = conn.execute(
             "SELECT id FROM categories WHERE user_id=? AND name=?", (user_id, name)
@@ -282,7 +289,7 @@ def get_transactions(user_id: int, date_from: str, date_to: str) -> list[sqlite3
     """date_from / date_to в формате YYYY-MM-DD, включительно."""
     with get_conn() as conn:
         return conn.execute(
-            """SELECT t.*, c.name AS category_name, p.name AS payment_name
+            """SELECT t.*, c.name AS category_name, c.emoji AS category_emoji, p.name AS payment_name
                FROM transactions t
                LEFT JOIN categories c ON c.id = t.category_id
                LEFT JOIN payment_methods p ON p.id = t.payment_method_id
@@ -418,7 +425,7 @@ def get_recent_transactions(
     with get_conn() as conn:
         if date_from and date_to:
             return conn.execute(
-                """SELECT t.*, c.name AS category_name, p.name AS payment_name
+                """SELECT t.*, c.name AS category_name, c.emoji AS category_emoji, p.name AS payment_name
                    FROM transactions t
                    LEFT JOIN categories c ON c.id = t.category_id
                    LEFT JOIN payment_methods p ON p.id = t.payment_method_id
@@ -428,7 +435,7 @@ def get_recent_transactions(
                 (user_id, date_from, date_to, limit, offset),
             ).fetchall()
         return conn.execute(
-            """SELECT t.*, c.name AS category_name, p.name AS payment_name
+            """SELECT t.*, c.name AS category_name, c.emoji AS category_emoji, p.name AS payment_name
                FROM transactions t
                LEFT JOIN categories c ON c.id = t.category_id
                LEFT JOIN payment_methods p ON p.id = t.payment_method_id
@@ -458,7 +465,7 @@ def count_all_transactions(
 def get_transaction_by_id(user_id: int, tx_id: int) -> sqlite3.Row | None:
     with get_conn() as conn:
         return conn.execute(
-            """SELECT t.*, c.name AS category_name, p.name AS payment_name
+            """SELECT t.*, c.name AS category_name, c.emoji AS category_emoji, p.name AS payment_name
                FROM transactions t
                LEFT JOIN categories c ON c.id = t.category_id
                LEFT JOIN payment_methods p ON p.id = t.payment_method_id
@@ -525,7 +532,7 @@ def add_recurring(
 def get_recurring_list(user_id: int) -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(
-            """SELECT r.*, c.name AS category_name, p.name AS payment_name
+            """SELECT r.*, c.name AS category_name, c.emoji AS category_emoji, p.name AS payment_name
                FROM recurring_payments r
                LEFT JOIN categories c ON c.id = r.category_id
                LEFT JOIN payment_methods p ON p.id = r.payment_method_id
@@ -588,7 +595,7 @@ def set_budget(user_id: int, category_id: int, monthly_limit: float) -> None:
 def get_budgets(user_id: int) -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(
-            """SELECT b.*, c.name AS category_name FROM category_budgets b
+            """SELECT b.*, c.name AS category_name, c.emoji AS category_emoji FROM category_budgets b
                JOIN categories c ON c.id = b.category_id
                WHERE b.user_id=? ORDER BY c.name""",
             (user_id,),
@@ -744,3 +751,126 @@ def get_learned_category_name(user_id: int, keyword: str) -> str | None:
             (user_id, keyword.strip().lower()),
         ).fetchone()
         return row["name"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Эмодзи категорий
+# ---------------------------------------------------------------------------
+
+def set_category_emoji(user_id: int, category_id: int, emoji: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE categories SET emoji=? WHERE id=? AND user_id=?", (emoji, category_id, user_id)
+        )
+        return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Настройки: импорт из банков, напоминание о простое, активность, бэкап
+# ---------------------------------------------------------------------------
+
+def get_settings(user_id: int) -> sqlite3.Row:
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT language, digest_frequency, bank_import_enabled, idle_reminder_enabled,
+                      last_activity_date, backup_last_sent
+               FROM users WHERE user_id=?""",
+            (user_id,),
+        ).fetchone()
+
+
+def set_bank_import_enabled(user_id: int, enabled: bool) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET bank_import_enabled=? WHERE user_id=?", (int(enabled), user_id))
+
+
+def set_idle_reminder_enabled(user_id: int, enabled: bool) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET idle_reminder_enabled=? WHERE user_id=?", (int(enabled), user_id))
+
+
+def touch_activity(user_id: int, today: str) -> None:
+    """Отмечает, что пользователь сегодня что-то делал - сбрасывает счётчик простоя."""
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET last_activity_date=? WHERE user_id=?", (today, user_id))
+
+
+def get_users_for_idle_check() -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT user_id, last_activity_date, idle_reminder_last_sent FROM users
+               WHERE idle_reminder_enabled=1"""
+        ).fetchall()
+
+
+def mark_idle_reminder_sent(user_id: int, sent_date: str) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET idle_reminder_last_sent=? WHERE user_id=?", (sent_date, user_id))
+
+
+def get_users_for_backup() -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute("SELECT user_id, backup_last_sent FROM users").fetchall()
+
+
+def mark_backup_sent(user_id: int, sent_date: str) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET backup_last_sent=? WHERE user_id=?", (sent_date, user_id))
+
+
+def get_users_bank_import_enabled() -> set[int]:
+    with get_conn() as conn:
+        return {r["user_id"] for r in conn.execute("SELECT user_id FROM users WHERE bank_import_enabled=1")}
+
+
+# ---------------------------------------------------------------------------
+# Полное удаление данных пользователя (опасная зона)
+# ---------------------------------------------------------------------------
+
+def delete_all_user_data(user_id: int) -> None:
+    """Полностью стирает финансовые данные пользователя. Сам user_id тоже
+    удаляется - при следующем /start всё пересоздастся с нуля (дефолтные
+    категории/способы оплаты)."""
+    with get_conn() as conn:
+        for table in (
+            "transactions", "receipts", "recurring_payments", "category_budgets",
+            "savings_goals", "learned_categories", "categories", "payment_methods",
+        ):
+            conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+
+
+def count_user_data(user_id: int) -> int:
+    """Сколько всего операций у пользователя - показываем перед удалением,
+    чтобы человек понимал масштаб того, что стирает."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM transactions WHERE user_id=?", (user_id,)).fetchone()
+        return row["n"]
+
+
+# ---------------------------------------------------------------------------
+# Полный личный бэкап (для JSON-выгрузки, НЕ вся общая база - см. backup.py)
+# ---------------------------------------------------------------------------
+
+def get_all_user_rows(user_id: int) -> dict:
+    with get_conn() as conn:
+        def rows_as_dicts(query):
+            return [dict(r) for r in conn.execute(query, (user_id,))]
+
+        return {
+            "categories": rows_as_dicts("SELECT name, emoji FROM categories WHERE user_id=?"),
+            "payment_methods": rows_as_dicts("SELECT name FROM payment_methods WHERE user_id=?"),
+            "transactions": rows_as_dicts(
+                """SELECT t.type, t.amount, c.name AS category, p.name AS payment_method,
+                          t.store, t.description, t.op_date, t.op_time
+                   FROM transactions t
+                   LEFT JOIN categories c ON c.id = t.category_id
+                   LEFT JOIN payment_methods p ON p.id = t.payment_method_id
+                   WHERE t.user_id=?"""
+            ),
+            "budgets": rows_as_dicts(
+                """SELECT c.name AS category, b.monthly_limit FROM category_budgets b
+                   JOIN categories c ON c.id = b.category_id WHERE b.user_id=?"""
+            ),
+            "goals": rows_as_dicts("SELECT name, target_amount, current_amount FROM savings_goals WHERE user_id=?"),
+        }

@@ -7,9 +7,7 @@
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
-  :root {
-    color-scheme: light dark;
-  }
+  :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
   body {
     margin: 0;
@@ -19,44 +17,39 @@
     padding: 12px 16px 32px;
   }
   h1 { font-size: 18px; margin: 8px 0 16px; }
-  .tabs {
-    display: flex; gap: 6px; margin-bottom: 16px; overflow-x: auto;
-  }
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; overflow-x: auto; }
   .tab {
     padding: 6px 14px; border-radius: 16px; font-size: 13px; white-space: nowrap;
     background: var(--tg-theme-secondary-bg-color, #f0f0f0);
     color: var(--tg-theme-text-color, #111);
-    cursor: pointer; border: none;
+    cursor: pointer; border: none; flex-shrink: 0;
   }
   .tab.active {
     background: var(--tg-theme-button-color, #2481cc);
     color: var(--tg-theme-button-text-color, #ffffff);
   }
+  select.tab { -webkit-appearance: none; appearance: none; font-family: inherit; }
   .card {
     background: var(--tg-theme-secondary-bg-color, #f7f7f7);
-    border-radius: 12px;
-    padding: 14px 16px;
-    margin-bottom: 12px;
+    border-radius: 12px; padding: 14px 16px; margin-bottom: 12px;
   }
   .card-title { font-size: 13px; opacity: 0.65; margin-bottom: 6px; }
   .card-value { font-size: 22px; font-weight: 600; }
   .row { display: flex; gap: 10px; }
   .row .card { flex: 1; }
-  .muted { opacity: 0.6; font-size: 12px; }
   .list-item {
     display: flex; justify-content: space-between; align-items: center;
     padding: 10px 0; border-bottom: 1px solid rgba(128,128,128,0.15);
     font-size: 14px;
   }
   .list-item:last-child { border-bottom: none; }
-  .list-item .left { display: flex; flex-direction: column; }
+  .list-item .left { display: flex; flex-direction: column; gap: 2px; }
   .list-item .cat { font-size: 12px; opacity: 0.6; }
-  .bar-bg {
-    background: rgba(128,128,128,0.2); border-radius: 6px; height: 8px; margin-top: 6px; overflow: hidden;
-  }
+  .bar-bg { background: rgba(128,128,128,0.2); border-radius: 6px; height: 8px; margin-top: 6px; overflow: hidden; }
   .bar-fill { height: 100%; border-radius: 6px; }
   .empty { text-align: center; opacity: 0.5; padding: 24px 0; font-size: 14px; }
-  canvas { max-height: 240px; }
+  canvas { max-height: 220px; }
+  .section-title { font-size: 14px; font-weight: 600; margin: 18px 0 8px; }
 </style>
 </head>
 <body>
@@ -64,20 +57,22 @@
 <h1>📊 Мой бюджет</h1>
 
 <div class="tabs">
-  <button class="tab active" data-tab="overview">Обзор</button>
-  <button class="tab" data-tab="transactions">Операции</button>
+  <button class="tab active" data-tab="overview">Обзор и операции</button>
   <button class="tab" data-tab="budgets">Бюджеты</button>
   <button class="tab" data-tab="goals">Цели</button>
 </div>
 
-<div class="tabs" id="period-tabs">
-  <button class="tab active" data-period="week">Неделя</button>
-  <button class="tab" data-period="month">Месяц</button>
-  <button class="tab" data-period="3months">3 месяца</button>
-  <button class="tab" data-period="year">Год</button>
-</div>
-
 <div id="view-overview">
+  <div class="tabs" id="period-tabs">
+    <button class="tab active" data-period="week">Неделя</button>
+    <button class="tab" data-period="month">Месяц</button>
+    <button class="tab" data-period="3months">3 месяца</button>
+    <button class="tab" data-period="year">Год</button>
+  </div>
+  <select id="category-filter" class="tab" style="width:100%; margin-bottom:12px; padding:8px;">
+    <option value="all">Все категории</option>
+  </select>
+
   <div class="row">
     <div class="card">
       <div class="card-title">💸 Расходы</div>
@@ -92,13 +87,13 @@
     <div class="card-title">Баланс</div>
     <div class="card-value" id="balance-value">—</div>
   </div>
+
   <div class="card">
     <div class="card-title">По категориям</div>
     <canvas id="category-chart"></canvas>
   </div>
-</div>
 
-<div id="view-transactions" style="display:none">
+  <div class="section-title">Операции</div>
   <div class="card" id="transactions-list"></div>
 </div>
 
@@ -117,6 +112,7 @@ const initData = tg?.initData || "";
 
 let currentTab = "overview";
 let currentPeriod = "month";
+let currentCategory = "all";
 let chart = null;
 
 async function api(path) {
@@ -125,50 +121,55 @@ async function api(path) {
   return res.json();
 }
 
-function fmtPct(pct) { return Math.round(pct) + "%"; }
+async function loadCategoryFilter() {
+  const data = await api("/api/category_list");
+  const select = document.getElementById("category-filter");
+  select.innerHTML = '<option value="all">Все категории</option>' +
+    data.items.map(c => `<option value="${encodeURIComponent(c.name)}">${c.emoji} ${c.name}</option>`).join("");
+}
 
 async function loadOverview() {
-  const [summary, categories] = await Promise.all([
+  const catParam = currentCategory !== "all" ? `&category=${currentCategory}` : "";
+  const [summary, categories, transactions] = await Promise.all([
     api(`/api/summary?period=${currentPeriod}`),
     api(`/api/categories?period=${currentPeriod}`),
+    api(`/api/transactions?period=${currentPeriod}${catParam}&limit=50`),
   ]);
+
   document.getElementById("expense-value").textContent = summary.expense_formatted;
   document.getElementById("income-value").textContent = summary.income_formatted;
   document.getElementById("balance-value").textContent = summary.balance_formatted;
 
   const ctx = document.getElementById("category-chart");
-  const labels = categories.items.map(i => i.category);
+  const labels = categories.items.map(i => `${i.emoji} ${i.category}`);
   const data = categories.items.map(i => i.amount);
   if (chart) chart.destroy();
-  if (data.length === 0) {
+  if (data.length > 0) {
+    chart = new Chart(ctx, {
+      type: "doughnut",
+      data: { labels, datasets: [{ data, backgroundColor: [
+        "#2481cc","#4caf50","#ff9800","#e91e63","#9c27b0","#00bcd4","#ffc107","#795548","#607d8b"
+      ] }] },
+      options: { plugins: { legend: { position: "bottom", labels: { boxWidth: 12, font: { size: 11 } } } } },
+    });
+  } else {
     ctx.getContext("2d").clearRect(0, 0, ctx.width, ctx.height);
-    return;
   }
-  chart = new Chart(ctx, {
-    type: "doughnut",
-    data: { labels, datasets: [{ data, backgroundColor: [
-      "#2481cc","#4caf50","#ff9800","#e91e63","#9c27b0","#00bcd4","#ffc107","#795548","#607d8b"
-    ] }] },
-    options: { plugins: { legend: { position: "bottom", labels: { boxWidth: 12, font: { size: 11 } } } } },
-  });
-}
 
-async function loadTransactions() {
-  const data = await api("/api/transactions?limit=30");
-  const el = document.getElementById("transactions-list");
-  if (data.items.length === 0) {
-    el.innerHTML = '<div class="empty">Пока нет операций</div>';
-    return;
-  }
-  el.innerHTML = data.items.map(t => `
-    <div class="list-item">
-      <div class="left">
-        <span>${t.description || t.store || "без описания"}</span>
-        <span class="cat">${t.date} · ${t.category || "—"}</span>
+  const listEl = document.getElementById("transactions-list");
+  if (transactions.items.length === 0) {
+    listEl.innerHTML = '<div class="empty">Операций не найдено</div>';
+  } else {
+    listEl.innerHTML = transactions.items.map(t => `
+      <div class="list-item">
+        <div class="left">
+          <span>${t.description || t.store || "без описания"}</span>
+          <span class="cat">${t.date} · ${t.category_emoji || "🏷"} ${t.category || "—"}</span>
+        </div>
+        <span>${t.type === "income" ? "+" : "-"}${t.amount_formatted}</span>
       </div>
-      <span>${t.type === "income" ? "+" : "-"}${t.amount_formatted}</span>
-    </div>
-  `).join("");
+    `).join("");
+  }
 }
 
 async function loadBudgets() {
@@ -212,7 +213,6 @@ async function loadGoals() {
 async function refresh() {
   try {
     if (currentTab === "overview") await loadOverview();
-    if (currentTab === "transactions") await loadTransactions();
     if (currentTab === "budgets") await loadBudgets();
     if (currentTab === "goals") await loadGoals();
   } catch (e) {
@@ -226,10 +226,9 @@ document.querySelectorAll(".tabs")[0].addEventListener("click", (e) => {
   document.querySelectorAll(".tabs")[0].querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
   btn.classList.add("active");
   currentTab = btn.dataset.tab;
-  ["overview","transactions","budgets","goals"].forEach(t => {
+  ["overview","budgets","goals"].forEach(t => {
     document.getElementById("view-" + t).style.display = (t === currentTab) ? "block" : "none";
   });
-  document.getElementById("period-tabs").style.display = (currentTab === "overview") ? "flex" : "none";
   refresh();
 });
 
@@ -242,6 +241,12 @@ document.getElementById("period-tabs").addEventListener("click", (e) => {
   refresh();
 });
 
+document.getElementById("category-filter").addEventListener("change", (e) => {
+  currentCategory = e.target.value;
+  refresh();
+});
+
+loadCategoryFilter();
 refresh();
 </script>
 </body>

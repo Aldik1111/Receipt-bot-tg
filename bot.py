@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import os
 import re
@@ -21,6 +22,8 @@ from aiogram.types import (
     Message,
 )
 
+import backup
+import bank_import
 import db
 import charts
 import export
@@ -59,6 +62,7 @@ class ManualEntry(StatesGroup):
 class CategoryEntry(StatesGroup):
     entering_name = State()
     editing_name = State()
+    editing_emoji = State()
 
 
 class PaymentEntry(StatesGroup):
@@ -73,7 +77,7 @@ class PaymentEntry(StatesGroup):
 def categories_keyboard(user_id: int, prefix: str) -> InlineKeyboardMarkup:
     cats = db.get_categories(user_id)
     buttons = [
-        [InlineKeyboardButton(text=c["name"], callback_data=f"{prefix}:{c['id']}")]
+        [InlineKeyboardButton(text=f"{c['emoji']} {c['name']}", callback_data=f"{prefix}:{c['id']}")]
         for c in cats
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -263,6 +267,7 @@ async def confirm_receipt_save(callback: CallbackQuery):
         )
         created_tx_ids.append(tx_id)
 
+    db.touch_activity(user_id, date.today().isoformat())
     RECEIPT_ITEM_IDS[receipt_id] = created_tx_ids
     edit_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
         text="📝 Позиции чека (поправить)", callback_data=f"recv_items:{receipt_id}"
@@ -391,6 +396,7 @@ async def add_enter_description(message: Message, state: FSMContext):
         op_date=date.today().strftime("%Y-%m-%d"),
         op_time=datetime.now().strftime("%H:%M"),
     )
+    db.touch_activity(message.from_user.id, date.today().isoformat())
     await state.clear()
     emoji = "💰" if data["tx_type"] == "income" else "💸"
     text = f"{emoji} Записано: {money(data['amount'])} — {description or 'без описания'}"
@@ -484,12 +490,24 @@ async def _send_stats(message: Message, user_id: int, date_from: str, date_to: s
     prev_from, prev_to = _previous_period_bounds(date_from, date_to)
     prev_expense = db.get_total_expense(user_id, prev_from, prev_to)
 
+    forecast_line = ""
+    d_from = date.fromisoformat(date_from)
+    d_to = date.fromisoformat(date_to)
+    today = date.today()
+    if d_from <= today <= d_to and total_expense > 0:
+        days_elapsed = (today - d_from).days + 1
+        days_total = (d_to - d_from).days + 1
+        if days_elapsed < days_total:
+            forecast = total_expense / days_elapsed * days_total
+            forecast_line = f"\n📈 Прогноз к концу периода: ~{money(forecast)}"
+
     summary = (
         f"📊 <b>Статистика {label}</b>\n"
         f"Период: {date_from} — {date_to}\n\n"
         f"💸 Расходы: {money(total_expense)}  ({_pct_change(total_expense, prev_expense)} к прошлому периоду)\n"
         f"💰 Доходы: {money(total_income)}\n"
         f"Баланс: {money(total_income - total_expense)}"
+        f"{forecast_line}"
     )
     show_list_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
         text="📋 Показать операции", callback_data=f"recent_from:{date_from}:{date_to}"
@@ -600,15 +618,16 @@ PROTECTED_CATEGORY = "Прочее"  # на неё переносятся тра
 
 def _categories_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     cats = db.get_categories(user_id)
-    text = "🏷 <b>Твои категории</b>\n\nНажми ✏️ чтобы переименовать, 🗑 чтобы удалить."
+    text = "🏷 <b>Твои категории</b>\n\nНажми 🎨 чтобы сменить эмодзи, ✏️ переименовать, 🗑 удалить."
 
     buttons = []
     for c in cats:
         if c["name"] == PROTECTED_CATEGORY:
-            buttons.append([InlineKeyboardButton(text=f"🔒 {c['name']}", callback_data="noop")])
+            buttons.append([InlineKeyboardButton(text=f"{c['emoji']} {c['name']} 🔒", callback_data="noop")])
         else:
             buttons.append([
-                InlineKeyboardButton(text=c["name"], callback_data="noop"),
+                InlineKeyboardButton(text=f"{c['emoji']} {c['name']}", callback_data="noop"),
+                InlineKeyboardButton(text="🎨", callback_data=f"cat_emoji:{c['id']}"),
                 InlineKeyboardButton(text="✏️", callback_data=f"cat_edit:{c['id']}"),
                 InlineKeyboardButton(text="🗑", callback_data=f"cat_del:{c['id']}"),
             ])
@@ -651,6 +670,28 @@ async def cat_edit_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(CategoryEntry.editing_name)
     await callback.message.edit_text("Введи новое название для этой категории:")
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cat_emoji:"))
+async def cat_emoji_start(callback: CallbackQuery, state: FSMContext):
+    cat_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(edit_cat_id=cat_id)
+    await state.set_state(CategoryEntry.editing_emoji)
+    await callback.message.edit_text("Пришли один эмодзи для этой категории:")
+    await callback.answer()
+
+
+@router.message(CategoryEntry.editing_emoji)
+async def cat_emoji_apply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    emoji = message.text.strip()
+    if len(emoji) > 4:  # грубая защита от случайного текста вместо эмодзи
+        await message.answer("Это не похоже на один эмодзи, попробуй ещё раз.")
+        return
+    db.set_category_emoji(message.from_user.id, data["edit_cat_id"], emoji)
+    await state.clear()
+    text, keyboard = _categories_view(message.from_user.id)
+    await message.answer(f"✅ Эмодзи обновлён.\n\n{text}", reply_markup=keyboard)
 
 
 @router.message(CategoryEntry.editing_name)
@@ -834,6 +875,32 @@ QUICK_ADD_RE = re.compile(r"^\s*([+-]?\d+(?:[.,]\d+)?)\s*(.*)$", re.DOTALL)
 
 @router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
 async def quick_add(message: Message, state: FSMContext):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+
+    if message.forward_date:
+        user_id = message.from_user.id
+        s = db.get_settings(user_id)
+        if s and s["bank_import_enabled"] and bank_import.looks_like_bank_notification(message.text):
+            parsed = bank_import.parse_bank_notification(message.text)
+            if not parsed:
+                await message.answer("📨 Похоже на банковское уведомление, но не смог распознать сумму.")
+                return
+            draft_id = f"bank_{message.message_id}"
+            PENDING_RECEIPTS[draft_id] = {
+                "store": parsed["store"], "date": date.today().isoformat(), "time": None,
+                "items": [{"name": parsed["store"] or "Банковское уведомление", "price": parsed["amount"],
+                            "category": categorize(parsed["store"] or "")}],
+                "total": parsed["amount"], "raw_text": message.text, "source": "bank_notification",
+            }
+            preview = _format_receipt_preview(PENDING_RECEIPTS[draft_id])
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Сохранить", callback_data=f"recv_save:{draft_id}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"recv_cancel:{draft_id}"),
+            ]])
+            await message.answer("📨 Распознал банковское уведомление:\n\n" + preview, reply_markup=keyboard)
+            return
+        # импорт выключен или не похоже на банк - падаем ниже, обрабатываем как обычный текст
+
     match = QUICK_ADD_RE.match(message.text)
     if not match:
         await message.answer(
@@ -844,7 +911,6 @@ async def quick_add(message: Message, state: FSMContext):
         return
 
     amount_raw, description_raw = match.groups()
-    db.ensure_user(message.from_user.id, message.from_user.username)
 
     tx_type = "income" if amount_raw.strip().startswith("+") else "expense"
     try:
@@ -872,6 +938,7 @@ async def quick_add(message: Message, state: FSMContext):
         op_date=date.today().strftime("%Y-%m-%d"),
         op_time=datetime.now().strftime("%H:%M"),
     )
+    db.touch_activity(message.from_user.id, date.today().isoformat())
 
     emoji = "💰" if tx_type == "income" else "💸"
     text = f"{emoji} Записано: {money(amount)} — {description or 'без описания'}\nКатегория: {category_name}"
@@ -921,7 +988,7 @@ def _recent_view(
     for r in rows:
         emoji = TYPE_EMOJI.get(r["type"], "•")
         label = r["description"] or r["store"] or "без описания"
-        cat = f" [{r['category_name']}]" if r["category_name"] else ""
+        cat = f" [{r['category_emoji']} {r['category_name']}]" if r["category_name"] else ""
         lines.append(f"{emoji} {r['op_date']} · {money(r['amount'])} · {label}{cat}")
         buttons.append([InlineKeyboardButton(
             text=f"✏️ {r['op_date']} · {money(r['amount'])} · {label}"[:60],
@@ -973,10 +1040,11 @@ def _tx_detail_view(user_id: int, tx_id: int) -> tuple[str, InlineKeyboardMarkup
         return None
 
     emoji = TYPE_EMOJI.get(r["type"], "•")
+    cat_display = f"{r['category_emoji']} {r['category_name']}" if r["category_name"] else "—"
     lines = [
         f"{emoji} <b>{money(r['amount'])}</b>",
         f"Дата: {r['op_date']}" + (f"  Время: {r['op_time']}" if r["op_time"] else ""),
-        f"Категория: {r['category_name'] or '—'}",
+        f"Категория: {cat_display}",
         f"Способ оплаты: {r['payment_name'] or '—'}",
         f"Магазин: {r['store'] or '—'}",
         f"Описание: {r['description'] or '—'}",
@@ -1736,6 +1804,279 @@ async def _digest_scheduler(bot: Bot):
 
 
 # ---------------------------------------------------------------------------
+# Единые настройки: /settings
+# ---------------------------------------------------------------------------
+
+def _settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    s = db.get_settings(user_id)
+    lang = s["language"]
+    lang_name = LANGUAGES.get(lang, lang)
+    digest_label = t(DIGEST_FREQ_LABELS.get(s["digest_frequency"], "digest_off"), lang)
+    idle_on = bool(s["idle_reminder_enabled"])
+    bank_on = bool(s["bank_import_enabled"])
+
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"🌐 Язык: {lang_name}\n"
+        f"🔔 Автосводка: {digest_label}\n"
+        f"📉 Напоминание о простое: {'включено' if idle_on else 'выключено'}\n"
+        f"🏦 Импорт из банковских уведомлений: {'включён' if bank_on else 'выключен'}\n"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Сменить язык", callback_data="settings_lang")],
+        [InlineKeyboardButton(text="🔔 Частота автосводки", callback_data="settings_digest")],
+        [InlineKeyboardButton(
+            text=f"📉 Напоминание: {'выключить' if idle_on else 'включить'}",
+            callback_data="settings_toggle_idle",
+        )],
+        [InlineKeyboardButton(
+            text=f"🏦 Импорт из банков: {'выключить' if bank_on else 'включить'}",
+            callback_data="settings_toggle_bank",
+        )],
+        [InlineKeyboardButton(text="📦 Скачать бэкап сейчас", callback_data="settings_backup_now")],
+        [InlineKeyboardButton(text="⚠️ Удалить все мои данные", callback_data="danger_start")],
+    ])
+    return text, keyboard
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    text, keyboard = _settings_view(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "settings_lang")
+async def settings_lang(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=name, callback_data=f"lang:{code}")]
+        for code, name in LANGUAGES.items()
+    ])
+    await callback.message.edit_text(t("language_prompt", db.get_user_language(callback.from_user.id)), reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings_digest")
+async def settings_digest(callback: CallbackQuery):
+    lang = db.get_user_language(callback.from_user.id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t(key, lang), callback_data=f"digest_freq:{freq}")]
+        for freq, key in DIGEST_FREQ_LABELS.items()
+    ])
+    await callback.message.edit_text(t("digest_prompt", lang), reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings_toggle_idle")
+async def settings_toggle_idle(callback: CallbackQuery):
+    s = db.get_settings(callback.from_user.id)
+    db.set_idle_reminder_enabled(callback.from_user.id, not s["idle_reminder_enabled"])
+    text, keyboard = _settings_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings_toggle_bank")
+async def settings_toggle_bank(callback: CallbackQuery):
+    s = db.get_settings(callback.from_user.id)
+    new_state = not s["bank_import_enabled"]
+    db.set_bank_import_enabled(callback.from_user.id, new_state)
+    text, keyboard = _settings_view(callback.from_user.id)
+    note = (
+        "\n\n📨 Теперь просто перешли мне уведомление о платеже из приложения "
+        "банка - я попробую распознать сумму и магазин."
+        if new_state else ""
+    )
+    await callback.message.edit_text(text + note, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings_backup_now")
+async def settings_backup_now(callback: CallbackQuery):
+    buf = backup.build_backup(callback.from_user.id)
+    await callback.message.answer_document(
+        BufferedInputFile(buf.read(), filename=f"backup_{date.today().isoformat()}.json")
+    )
+    db.mark_backup_sent(callback.from_user.id, date.today().isoformat())
+    await callback.answer("Бэкап отправлен")
+
+
+# ---------------------------------------------------------------------------
+# Опасная зона: полное удаление всех данных (двойное подтверждение)
+# ---------------------------------------------------------------------------
+
+class DangerZone(StatesGroup):
+    entering_phrase = State()
+
+
+@router.callback_query(F.data == "danger_start")
+async def danger_start(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    count = db.count_user_data(user_id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⚠️ Да, я понимаю последствия", callback_data="danger_confirm1"),
+        InlineKeyboardButton(text="◀️ Отмена", callback_data="danger_cancel"),
+    ]])
+    await callback.message.edit_text(
+        f"⚠️ <b>Это удалит НАВСЕГДА:</b>\n"
+        f"— {count} операций\n"
+        f"— все категории, способы оплаты, бюджеты и цели\n\n"
+        f"Восстановить будет нельзя (если не делал /settings → бэкап заранее).\n\n"
+        f"Точно продолжить?",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "danger_confirm1")
+async def danger_confirm1(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DangerZone.entering_phrase)
+    await callback.message.edit_text(
+        "Последний шаг. Чтобы подтвердить, напиши сообщением ровно:\n\n<code>УДАЛИТЬ ВСЁ</code>"
+    )
+    await callback.answer()
+
+
+@router.message(DangerZone.entering_phrase)
+async def danger_confirm2(message: Message, state: FSMContext):
+    await state.clear()
+    if message.text.strip() != "УДАЛИТЬ ВСЁ":
+        await message.answer("Фраза не совпала - ничего не удалено. Если передумал, это и хорошо.")
+        return
+    db.delete_all_user_data(message.from_user.id)
+    await message.answer("Готово, все данные удалены. /start - чтобы начать заново.")
+
+
+@router.callback_query(F.data == "danger_cancel")
+async def danger_cancel(callback: CallbackQuery):
+    text, keyboard = _settings_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer("Отменено")
+
+
+# ---------------------------------------------------------------------------
+# Импорт: файлы выписок (обработчик форварда банковских уведомлений теперь
+# стоит выше, перед quick_add - см. handle_forwarded_bank_notification)
+# ---------------------------------------------------------------------------
+
+IMPORT_DRAFTS: dict[int, list[dict]] = {}
+
+
+@router.message(F.document, F.document.file_name.regexp(r"\.(csv|xlsx?)$"))
+async def handle_import_file(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    db.ensure_user(user_id, message.from_user.username)
+
+    file = await bot.get_file(message.document.file_id)
+    buf = io.BytesIO()
+    await bot.download_file(file.file_path, destination=buf)
+
+    try:
+        rows = export.parse_import_file(buf.getvalue(), message.document.file_name)
+    except Exception:
+        logger.exception("Ошибка разбора импортируемого файла")
+        await message.answer("⚠️ Не смог прочитать файл. Поддерживаются CSV и Excel с колонками дата/сумма/описание.")
+        return
+
+    if not rows:
+        await message.answer(
+            "⚠️ Не нашёл в файле колонку с суммой. Убедись, что в первой строке "
+            "есть заголовок вроде «Сумма» / «Amount»."
+        )
+        return
+
+    IMPORT_DRAFTS[user_id] = rows
+    total = sum(r["amount"] for r in rows)
+    preview_lines = [f"• {r['date'] or '—'} — {money(r['amount'])} — {r['description'] or 'без описания'}" for r in rows[:10]]
+    more = f"\n… и ещё {len(rows) - 10}" if len(rows) > 10 else ""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"✅ Импортировать всё ({len(rows)})", callback_data="import_confirm"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="import_cancel"),
+    ]])
+    await message.answer(
+        f"📤 Нашёл {len(rows)} операций на общую сумму {money(total)}:\n\n"
+        + "\n".join(preview_lines) + more + "\n\nИмпортировать?",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data == "import_confirm")
+async def import_confirm(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    rows = IMPORT_DRAFTS.pop(user_id, [])
+    if not rows:
+        await callback.answer("Черновик устарел", show_alert=True)
+        return
+    pm_id = db.get_default_payment_method_id(user_id)
+    for r in rows:
+        cat_name = await asyncio.to_thread(categorize_smart, user_id, r["description"] or "")
+        cat_id = db.get_category_id_by_name(user_id, cat_name)
+        db.add_transaction(
+            user_id=user_id, tx_type=r["type"], amount=r["amount"], category_id=cat_id,
+            payment_method_id=pm_id, store=None, description=r["description"],
+            op_date=r["date"] or date.today().isoformat(),
+        )
+    await callback.message.edit_text(f"✅ Импортировано {len(rows)} операций.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "import_cancel")
+async def import_cancel(callback: CallbackQuery):
+    IMPORT_DRAFTS.pop(callback.from_user.id, None)
+    await callback.message.edit_text("❌ Импорт отменён.")
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Напоминание о простое и автобэкап - фоновые задачи
+# ---------------------------------------------------------------------------
+
+async def _idle_reminder_scheduler(bot: Bot):
+    while True:
+        today = date.today()
+        for row in db.get_users_for_idle_check():
+            last_activity = date.fromisoformat(row["last_activity_date"]) if row["last_activity_date"] else None
+            if last_activity and (today - last_activity).days < 3:
+                continue
+            last_sent = date.fromisoformat(row["idle_reminder_last_sent"]) if row["idle_reminder_last_sent"] else None
+            if last_sent and (today - last_sent).days < 3:
+                continue  # не спамим чаще раза в 3 дня
+            try:
+                await bot.send_message(
+                    row["user_id"],
+                    "👋 Давно не было новых записей. Всё в порядке? Если что - "
+                    "просто напиши сумму и что купил, займёт секунду."
+                )
+                db.mark_idle_reminder_sent(row["user_id"], today.isoformat())
+            except Exception:
+                logger.exception("Не удалось отправить напоминание о простое пользователю %s", row["user_id"])
+        await asyncio.sleep(12 * 3600)
+
+
+async def _backup_scheduler(bot: Bot):
+    while True:
+        today = date.today()
+        for row in db.get_users_for_backup():
+            last_sent = date.fromisoformat(row["backup_last_sent"]) if row["backup_last_sent"] else None
+            if last_sent and (today - last_sent).days < 7:
+                continue
+            user_id = row["user_id"]
+            if db.count_user_data(user_id) == 0:
+                continue  # нечего бэкапить
+            try:
+                buf = backup.build_backup(user_id)
+                await bot.send_document(
+                    user_id,
+                    BufferedInputFile(buf.read(), filename=f"backup_{today.isoformat()}.json"),
+                    caption="📦 Еженедельный автобэкап твоих данных",
+                )
+                db.mark_backup_sent(user_id, today.isoformat())
+            except Exception:
+                logger.exception("Не удалось отправить автобэкап пользователю %s", user_id)
+        await asyncio.sleep(24 * 3600)
+
+
+# ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
 
@@ -1754,6 +2095,8 @@ async def main():
 
     asyncio.create_task(_recurring_scheduler(bot))
     asyncio.create_task(_digest_scheduler(bot))
+    asyncio.create_task(_idle_reminder_scheduler(bot))
+    asyncio.create_task(_backup_scheduler(bot))
     await dp.start_polling(bot)
 
 

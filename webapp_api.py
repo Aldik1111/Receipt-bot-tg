@@ -51,7 +51,10 @@ async def get_summary(request: web.Request) -> web.Response:
         return web.json_response({"error": "unauthorized"}, status=401)
 
     period = request.query.get("period", "month")
-    date_from, date_to = _period_bounds(period)
+    if request.query.get("date_from") and request.query.get("date_to"):
+        date_from, date_to = request.query["date_from"], request.query["date_to"]
+    else:
+        date_from, date_to = _period_bounds(period)
     rows = db.get_transactions(user_id, date_from, date_to)
     expense = sum(r["amount"] for r in rows if r["type"] == "expense")
     income = sum(r["amount"] for r in rows if r["type"] == "income")
@@ -75,21 +78,37 @@ async def get_categories_breakdown(request: web.Request) -> web.Response:
         return web.json_response({"error": "unauthorized"}, status=401)
 
     period = request.query.get("period", "month")
-    date_from, date_to = _period_bounds(period)
+    if request.query.get("date_from") and request.query.get("date_to"):
+        date_from, date_to = request.query["date_from"], request.query["date_to"]
+    else:
+        date_from, date_to = _period_bounds(period)
     rows = db.get_transactions(user_id, date_from, date_to)
     expenses = [r for r in rows if r["type"] == "expense"]
     total = sum(r["amount"] for r in expenses)
 
     totals: dict[str, float] = {}
+    emojis: dict[str, str] = {}
     for r in expenses:
         name = r["category_name"] or "Без категории"
         totals[name] = totals.get(name, 0) + r["amount"]
+        emojis[name] = r["category_emoji"] or "🏷"
 
     items = [
-        {"category": name, "amount": amount, "pct": (amount / total * 100) if total else 0}
+        {"category": name, "emoji": emojis.get(name, "🏷"), "amount": amount,
+         "pct": (amount / total * 100) if total else 0}
         for name, amount in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
     ]
     return web.json_response({"items": items, "total": total})
+
+
+@routes.get("/api/category_list")
+async def get_category_list(request: web.Request) -> web.Response:
+    """Лёгкий список категорий (для выпадающего фильтра на дашборде)."""
+    user_id = _authenticate(request)
+    if not user_id:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    items = [{"name": c["name"], "emoji": c["emoji"]} for c in db.get_categories(user_id)]
+    return web.json_response({"items": items})
 
 
 @routes.get("/api/transactions")
@@ -98,9 +117,17 @@ async def get_transactions_list(request: web.Request) -> web.Response:
     if not user_id:
         return web.json_response({"error": "unauthorized"}, status=401)
 
-    limit = min(int(request.query.get("limit", 20)), 100)
+    limit = min(int(request.query.get("limit", 50)), 200)
     offset = int(request.query.get("offset", 0))
-    rows = db.get_recent_transactions(user_id, limit=limit, offset=offset)
+    date_from = request.query.get("date_from")
+    date_to = request.query.get("date_to")
+    category = request.query.get("category")
+
+    rows = db.get_recent_transactions(user_id, limit=500, offset=0, date_from=date_from, date_to=date_to)
+    if category and category != "all":
+        rows = [r for r in rows if r["category_name"] == category]
+    total_count = len(rows)
+    rows = rows[offset:offset + limit]
 
     items = [{
         "id": r["id"],
@@ -108,13 +135,14 @@ async def get_transactions_list(request: web.Request) -> web.Response:
         "amount": r["amount"],
         "amount_formatted": money(r["amount"]),
         "category": r["category_name"],
+        "category_emoji": r["category_emoji"] or "🏷",
         "payment": r["payment_name"],
         "store": r["store"],
         "description": r["description"],
         "date": r["op_date"],
         "time": r["op_time"],
     } for r in rows]
-    return web.json_response({"items": items, "total": db.count_all_transactions(user_id)})
+    return web.json_response({"items": items, "total": total_count})
 
 
 @routes.get("/api/budgets")

@@ -35,6 +35,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "🔁 /recurring - повторяющиеся платежи\n"
             "📤 /export - выгрузить операции в файл\n"
             "🔔 /digest - автосводка и AI-инсайты по расписанию\n"
+            "⚙️ /settings - язык, автосводка, напоминания, импорт из банков, удаление данных\n"
+            "📨 Перешли уведомление банка (после включения импорта в /settings) - "
+            "распознаю платёж автоматически\n"
+            "📎 Пришли CSV/Excel из другого приложения - предложу импортировать\n"
             "🌐 /language - сменить язык\n"
             "❓ /help - это сообщение"
         ),
@@ -93,6 +97,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "🔁 /recurring - қайталанатын төлемдер\n"
             "📤 /export - операцияларды файлға шығару\n"
             "🔔 /digest - кесте бойынша авто-жинақ және AI-түсінік\n"
+            "⚙️ /settings - тіл, авто-жинақ, еске салулар, банктен импорт, деректерді өшіру\n"
+            "📨 Банк хабарламасын қайта жіберші (алдымен /settings-те импортты қос) - "
+            "төлемді автоматты танимын\n"
+            "📎 Басқа қосымшадан CSV/Excel жібер - импорттауды ұсынамын\n"
             "🌐 /language - тілді ауыстыру\n"
             "❓ /help - осы хабарлама"
         ),
@@ -151,6 +159,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "🔁 /recurring - recurring payments\n"
             "📤 /export - export entries to a file\n"
             "🔔 /digest - scheduled summary + AI insight\n"
+            "⚙️ /settings - language, digest, reminders, bank import, delete all data\n"
+            "📨 Forward a bank notification (after enabling import in /settings) - "
+            "I'll try to recognize the payment\n"
+            "📎 Send a CSV/Excel from another app - I'll offer to import it\n"
             "🌐 /language - change language\n"
             "❓ /help - this message"
         ),
