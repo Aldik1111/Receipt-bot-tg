@@ -4,16 +4,17 @@ import logging
 import os
 import re
 import tempfile
+import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -27,9 +28,10 @@ import bank_import
 import db
 import charts
 import export
-from categorizer import categorize, categorize_smart
+from categorizer import categorize, categorize_many, categorize_smart
 from config import ADMIN_USER_ID, BOT_TOKEN
-from formatting import money
+from formatting import hx, money, parse_positive_amount
+from fsm_storage import SQLiteStorage
 from gemini_engine import generate_insight_text
 from i18n import LANGUAGES, t
 from receipt_pipeline import extract_receipt
@@ -38,17 +40,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = Router()
+BACKGROUND_TASKS: list[asyncio.Task] = []
+TEXT_HINT = "Пришли текстом. /cancel — сбросить сценарий."
+MAX_IMPORT_BYTES = 2 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-# Временное хранилище "черновиков" распознанных чеков, ожидающих подтверждения
-# (в реальном проде для нескольких воркеров лучше вынести в Redis/БД, но для
-# одного процесса обычного словаря в памяти достаточно)
+# Черновики распознанных чеков, ожидающих подтверждения, и незавершённый
+# импорт файла. Лежат в SQLite (таблица app_state), а не в словарях в памяти:
+# рестарт бота между "вот твой чек" и нажатием "Сохранить" больше не теряет
+# результат распознавания, за который уже заплачен запрос к Gemini.
 # ---------------------------------------------------------------------------
-PENDING_RECEIPTS: dict[str, dict] = {}
-
-# id созданных транзакций по каждому сохранённому чеку - чтобы можно было
-# открыть их для правки одним тапом через уже готовый редактор операций
-RECEIPT_ITEM_IDS: dict[int, list[int]] = {}
+RECEIPT_SCOPE = "receipt_draft"
+IMPORT_SCOPE = "import_draft"
+LIST_SCOPE = "list_context"
 
 
 class ManualEntry(StatesGroup):
@@ -128,17 +132,27 @@ async def cmd_help(message: Message):
     await message.answer(t("help_text", lang))
 
 
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    current = await state.get_state()
+    await state.clear()
+    if current:
+        await message.answer("Ок, сценарий сброшен. Можешь начать заново.")
+    else:
+        await message.answer("Сейчас нет активного сценария.")
+
+
 # ---------------------------------------------------------------------------
 # Обработка фото чека
 # ---------------------------------------------------------------------------
 
-@router.message(F.photo)
+@router.message(StateFilter(None), F.photo)
 async def handle_receipt_photo(message: Message, bot: Bot):
     photo = message.photo[-1]  # берём максимальное качество из доступных превью
     await _process_receipt(message, bot, file_id=photo.file_id, unique_id=photo.file_unique_id)
 
 
-@router.message(F.document, F.document.mime_type.startswith("image/"))
+@router.message(StateFilter(None), F.document, F.document.mime_type.startswith("image/"))
 async def handle_receipt_document(message: Message, bot: Bot):
     # Telegram сильно сжимает фото, отправленные как "фото" - это одна из
     # главных причин плохого распознавания. Если прислать снимок как файл
@@ -153,14 +167,20 @@ async def _process_receipt(message: Message, bot: Bot, file_id: str, unique_id: 
     status = await message.answer("🔍 Распознаю чек, подожди немного...")
 
     file = await bot.get_file(file_id)
+    suffix = os.path.splitext(file.file_path or "")[1].lower()
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        suffix = ".jpg"
     local_path = os.path.join(
         tempfile.gettempdir(),
-        f"receipt_{message.from_user.id}_{unique_id}.jpg",
+        f"receipt_{message.from_user.id}_{uuid.uuid4().hex}{suffix}",
     )
     await bot.download_file(file.file_path, destination=local_path)
 
     try:
-        parsed = extract_receipt(local_path, message.from_user.id)
+        # Gemini ходит по сети синхронным requests (до 30 сек) и внутри ещё
+        # категоризирует товары через SQLite. В event loop это заморозило бы
+        # бота целиком для всех пользователей - выносим в отдельный поток.
+        parsed = await asyncio.to_thread(extract_receipt, local_path, message.from_user.id)
     except Exception:
         logger.exception("Receipt extraction error")
         await status.edit_text(
@@ -182,10 +202,12 @@ async def _process_receipt(message: Message, bot: Bot, file_id: str, unique_id: 
         )
         return
 
-    draft_id = f"{message.from_user.id}_{unique_id}"
-    PENDING_RECEIPTS[draft_id] = parsed
+    draft_id = uuid.uuid4().hex[:16]
+    db.save_state(RECEIPT_SCOPE, draft_id, parsed, user_id=message.from_user.id)
 
     text = _format_receipt_preview(parsed)
+    if len(text) > 3500:
+        text = text[:3500].rstrip() + "\n… позиции обрезаны в превью, при сохранении запишутся все."
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -208,12 +230,12 @@ def _format_receipt_preview(parsed: dict) -> str:
     if source_label:
         lines.append(f"<i>Источник: {source_label}</i>")
     lines.append("")
-    lines.append(f"Магазин: {parsed['store'] or '—'}")
-    lines.append(f"Дата: {parsed['date'] or '—'}   Время: {parsed['time'] or '—'}\n")
+    lines.append(f"Магазин: {hx(parsed['store']) or '—'}")
+    lines.append(f"Дата: {hx(parsed['date']) or '—'}   Время: {hx(parsed['time']) or '—'}\n")
     total = 0.0
     for item in parsed["items"]:
         category = item.get("category", "Прочее")
-        lines.append(f"• {item['name']} — {money(item['price'])}  [{category}]")
+        lines.append(f"• {hx(item['name'])} — {money(item['price'])}  [{hx(category)}]")
         total += item["price"]
     lines.append(f"\nИтого по товарам: {money(total)}")
     if parsed["total"] is not None:
@@ -228,47 +250,26 @@ def _format_receipt_preview(parsed: dict) -> str:
 @router.callback_query(F.data.startswith("recv_save:"))
 async def confirm_receipt_save(callback: CallbackQuery):
     draft_id = callback.data.split(":", 1)[1]
-    parsed = PENDING_RECEIPTS.pop(draft_id, None)
-    if not parsed:
+    user_id = callback.from_user.id
+    today = date.today().isoformat()
+
+    try:
+        result = db.save_receipt_draft(user_id, draft_id, fallback_date=today)
+    except Exception:
+        # Транзакция уже откатилась; черновик остался, поэтому пользователь
+        # может нажать «Сохранить» ещё раз после временного сбоя.
+        logger.exception("Не удалось атомарно сохранить чек %s", draft_id)
+        await callback.answer(
+            "Не удалось сохранить. Черновик не потерян — попробуй ещё раз.",
+            show_alert=True,
+        )
+        return
+
+    if result is None:
         await callback.answer("Черновик устарел, пришли фото заново", show_alert=True)
         return
 
-    user_id = callback.from_user.id
-    op_date = parsed["date"] or date.today().strftime("%Y-%m-%d")
-
-    # По умолчанию используем "Наличные", если он есть, иначе первый попавшийся
-    payment_method_id = db.get_default_payment_method_id(user_id)
-
-    receipt_id = db.create_receipt(
-        user_id=user_id,
-        store=parsed["store"],
-        receipt_date=parsed["date"],
-        receipt_time=parsed["time"],
-        payment_method_id=payment_method_id,
-        raw_text=parsed["raw_text"],
-    )
-
-    touched_categories = set()
-    created_tx_ids = []
-    for item in parsed["items"]:
-        cat_id = db.get_category_id_by_name(user_id, item["category"])
-        touched_categories.add(cat_id)
-        tx_id = db.add_transaction(
-            user_id=user_id,
-            tx_type="expense",
-            amount=item["price"],
-            category_id=cat_id,
-            payment_method_id=payment_method_id,
-            store=parsed["store"],
-            description=item["name"],
-            op_date=op_date,
-            op_time=parsed["time"],
-            receipt_id=receipt_id,
-        )
-        created_tx_ids.append(tx_id)
-
-    db.touch_activity(user_id, date.today().isoformat())
-    RECEIPT_ITEM_IDS[receipt_id] = created_tx_ids
+    receipt_id, touched_categories = result
     edit_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
         text="📝 Позиции чека (поправить)", callback_data=f"recv_items:{receipt_id}"
     )]])
@@ -285,18 +286,16 @@ async def confirm_receipt_save(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("recv_items:"))
 async def show_receipt_items(callback: CallbackQuery):
     receipt_id = int(callback.data.split(":", 1)[1])
-    tx_ids = RECEIPT_ITEM_IDS.get(receipt_id, [])
     user_id = callback.from_user.id
 
     buttons = []
     lines = ["🧾 <b>Позиции чека</b>\n"]
-    for tx_id in tx_ids:
-        tx = db.get_transaction_by_id(user_id, tx_id)
-        if not tx:
-            continue
-        lines.append(f"• {tx['description']} — {money(tx['amount'])} [{tx['category_name'] or '—'}]")
+    # Связь позиций с чеком берём из самой базы (transactions.receipt_id):
+    # переживает рестарт и не врёт, если часть позиций уже удалили.
+    for tx in db.get_transactions_by_receipt(user_id, receipt_id):
+        lines.append(f"• {hx(tx['description'])} — {money(tx['amount'])} [{hx(tx['category_name']) or '—'}]")
         buttons.append([InlineKeyboardButton(
-            text=f"✏️ {tx['description']}"[:60], callback_data=f"tx_open:{tx_id}"
+            text=f"✏️ {tx['description']}"[:60], callback_data=f"tx_open:{tx['id']}"
         )])
     if not buttons:
         await callback.answer("Позиции не найдены", show_alert=True)
@@ -308,7 +307,7 @@ async def show_receipt_items(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("recv_cancel:"))
 async def cancel_receipt_save(callback: CallbackQuery):
     draft_id = callback.data.split(":", 1)[1]
-    PENDING_RECEIPTS.pop(draft_id, None)
+    db.delete_state(RECEIPT_SCOPE, draft_id, user_id=callback.from_user.id)
     await callback.message.edit_text("❌ Отменено, ничего не сохранено.", reply_markup=None)
     await callback.answer()
 
@@ -343,11 +342,8 @@ async def add_choose_type(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ManualEntry.entering_amount)
 async def add_enter_amount(message: Message, state: FSMContext):
-    try:
-        amount = float(message.text.replace(",", "."))
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
+    amount = parse_positive_amount(message.text)
+    if amount is None:
         await message.answer("Пришли число, например: 350 или 350.50")
         return
 
@@ -382,6 +378,9 @@ async def add_choose_payment(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ManualEntry.entering_description)
 async def add_enter_description(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     data = await state.get_data()
     description = None if message.text.strip() == "-" else message.text.strip()
 
@@ -456,6 +455,15 @@ async def _budget_warning_text(user_id: int, category_id: int | None) -> str | N
     return None
 
 
+def _month_start(today: date, months_back: int = 0) -> date:
+    month = today.month - months_back
+    year = today.year
+    while month <= 0:
+        month += 12
+        year -= 1
+    return date(year, month, 1)
+
+
 def _period_bounds(period: str) -> tuple[str, str, str]:
     today = date.today()
     if period == "day":
@@ -467,7 +475,7 @@ def _period_bounds(period: str) -> tuple[str, str, str]:
         start = today.replace(day=1)
         return start.isoformat(), today.isoformat(), "за месяц"
     if period == "3months":
-        start = (today.replace(day=1) - timedelta(days=62)).replace(day=1)
+        start = _month_start(today, months_back=2)
         return start.isoformat(), today.isoformat(), "за 3 месяца"
     if period == "year":
         start = today.replace(month=1, day=1)
@@ -518,7 +526,8 @@ async def _send_stats(message: Message, user_id: int, date_from: str, date_to: s
         await message.answer("Расходов за этот период нет.")
         return
 
-    buf = charts.pie_chart_by_category(expenses, f"Расходы {label}")
+    # Отрисовка PNG в matplotlib - заметная CPU-работа, в поток её
+    buf = await asyncio.to_thread(charts.pie_chart_by_category, expenses, f"Расходы {label}")
     await message.answer_photo(BufferedInputFile(buf.read(), filename="by_category.png"))
 
     # Куда - топ магазинов/мест
@@ -550,14 +559,17 @@ async def _send_stats(message: Message, user_id: int, date_from: str, date_to: s
         for e in expenses:
             d = date.fromisoformat(e["op_date"])
             if span_days <= 31:
-                key = f"{RU_WEEKDAYS[d.weekday()]} {d.day:02d}"
+                key = f"{d.isoformat()} {RU_WEEKDAYS[d.weekday()]}"
             elif span_days <= 120:
-                key = f"Нед.{d.isocalendar()[1]}"
+                iso = d.isocalendar()
+                key = f"{iso[0]}-W{iso[1]:02d}"
             else:
-                key = RU_MONTHS[d.month - 1]
+                key = f"{d.year}-{d.month:02d} {RU_MONTHS[d.month - 1]}"
             buckets[key] = buckets.get(key, 0) + e["amount"]
         if len(buckets) > 1:
-            buf2 = charts.bar_chart_by_period(buckets, f"Динамика трат {label}")
+            buf2 = await asyncio.to_thread(
+                charts.bar_chart_by_period, buckets, f"Динамика трат {label}"
+            )
             await message.answer_photo(BufferedInputFile(buf2.read(), filename="trend.png"))
 
 
@@ -585,6 +597,9 @@ async def stats_custom_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(StatsCustomPeriod.entering_dates)
 async def stats_custom_apply(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     parts = message.text.split()
     if len(parts) != 2:
         await message.answer("Нужно два числа через пробел, например: 01.03.2026 15.03.2026")
@@ -656,6 +671,9 @@ async def cat_add_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(CategoryEntry.entering_name)
 async def add_category_name(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     name = message.text.strip()
     db.add_category(message.from_user.id, name)
     await state.clear()
@@ -666,6 +684,9 @@ async def add_category_name(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("cat_edit:"))
 async def cat_edit_start(callback: CallbackQuery, state: FSMContext):
     cat_id = int(callback.data.split(":", 1)[1])
+    if db.get_category_name(callback.from_user.id, cat_id) == PROTECTED_CATEGORY:
+        await callback.answer("Это базовая категория - её нельзя переименовать", show_alert=True)
+        return
     await state.update_data(edit_cat_id=cat_id)
     await state.set_state(CategoryEntry.editing_name)
     await callback.message.edit_text("Введи новое название для этой категории:")
@@ -683,6 +704,9 @@ async def cat_emoji_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(CategoryEntry.editing_emoji)
 async def cat_emoji_apply(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     data = await state.get_data()
     emoji = message.text.strip()
     if len(emoji) > 4:  # грубая защита от случайного текста вместо эмодзи
@@ -696,6 +720,9 @@ async def cat_emoji_apply(message: Message, state: FSMContext):
 
 @router.message(CategoryEntry.editing_name)
 async def edit_category_name(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     data = await state.get_data()
     cat_id = data["edit_cat_id"]
     new_name = message.text.strip()
@@ -790,6 +817,9 @@ async def pay_add_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(PaymentEntry.entering_name)
 async def add_payment_name(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     name = message.text.strip()
     db.add_payment_method(message.from_user.id, name)
     await state.clear()
@@ -808,6 +838,9 @@ async def pay_edit_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(PaymentEntry.editing_name)
 async def edit_payment_name(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     data = await state.get_data()
     pm_id = data["edit_pm_id"]
     new_name = message.text.strip()
@@ -885,14 +918,18 @@ async def quick_add(message: Message, state: FSMContext):
             if not parsed:
                 await message.answer("📨 Похоже на банковское уведомление, но не смог распознать сумму.")
                 return
-            draft_id = f"bank_{message.message_id}"
-            PENDING_RECEIPTS[draft_id] = {
+            # message_id уникален только внутри чата; user_id не даёт
+            # черновикам двух пользователей перезаписать друг друга.
+            draft_id = f"bank_{user_id}_{message.message_id}"
+            draft = {
                 "store": parsed["store"], "date": date.today().isoformat(), "time": None,
                 "items": [{"name": parsed["store"] or "Банковское уведомление", "price": parsed["amount"],
                             "category": categorize(parsed["store"] or "")}],
-                "total": parsed["amount"], "raw_text": message.text, "source": "bank_notification",
+                "total": parsed["amount"], "raw_text": "", "source": "bank_notification",
+                "tx_type": parsed["type"],
             }
-            preview = _format_receipt_preview(PENDING_RECEIPTS[draft_id])
+            db.save_state(RECEIPT_SCOPE, draft_id, draft, user_id=user_id)
+            preview = _format_receipt_preview(draft)
             keyboard = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="✅ Сохранить", callback_data=f"recv_save:{draft_id}"),
                 InlineKeyboardButton(text="❌ Отмена", callback_data=f"recv_cancel:{draft_id}"),
@@ -913,13 +950,9 @@ async def quick_add(message: Message, state: FSMContext):
     amount_raw, description_raw = match.groups()
 
     tx_type = "income" if amount_raw.strip().startswith("+") else "expense"
-    try:
-        amount = abs(float(amount_raw.replace(",", ".")))
-    except ValueError:
+    amount = parse_positive_amount(amount_raw.lstrip("+"))
+    if amount is None:
         await message.answer("Не смог разобрать сумму, попробуй ещё раз.")
-        return
-    if amount <= 0:
-        await message.answer("Сумма должна быть больше нуля.")
         return
 
     description = description_raw.strip() or None
@@ -941,7 +974,7 @@ async def quick_add(message: Message, state: FSMContext):
     db.touch_activity(message.from_user.id, date.today().isoformat())
 
     emoji = "💰" if tx_type == "income" else "💸"
-    text = f"{emoji} Записано: {money(amount)} — {description or 'без описания'}\nКатегория: {category_name}"
+    text = f"{emoji} Записано: {money(amount)} — {hx(description) or 'без описания'}\nКатегория: {hx(category_name)}"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="✏️ Изменить", callback_data=f"tx_open:{tx_id}")]]
     )
@@ -962,13 +995,19 @@ TYPE_EMOJI = {"expense": "💸", "income": "💰"}
 # Последний открытый пользователем список операций (фильтр по датам + номер
 # страницы) - нужно, чтобы кнопка "◀️ Назад" из карточки операции возвращала
 # туда же, откуда пришли, а не всегда на первую страницу без фильтра.
-LIST_CONTEXT: dict[int, tuple[str | None, str | None, int]] = {}
+
+def _get_list_context(user_id: int) -> tuple[str | None, str | None, int]:
+    saved = db.load_state(LIST_SCOPE, str(user_id))
+    if not saved:
+        return None, None, 0
+    date_from, date_to, page = saved
+    return date_from, date_to, page
 
 
 def _recent_view(
     user_id: int, date_from: str | None, date_to: str | None, page: int
 ) -> tuple[str, InlineKeyboardMarkup]:
-    LIST_CONTEXT[user_id] = (date_from, date_to, page)
+    db.save_state(LIST_SCOPE, str(user_id), [date_from, date_to, page], user_id=user_id)
 
     total = db.count_all_transactions(user_id, date_from, date_to)
     rows = db.get_recent_transactions(
@@ -987,8 +1026,8 @@ def _recent_view(
     buttons = []
     for r in rows:
         emoji = TYPE_EMOJI.get(r["type"], "•")
-        label = r["description"] or r["store"] or "без описания"
-        cat = f" [{r['category_emoji']} {r['category_name']}]" if r["category_name"] else ""
+        label = hx(r["description"] or r["store"] or "без описания")
+        cat = f" [{r['category_emoji']} {hx(r['category_name'])}]" if r["category_name"] else ""
         lines.append(f"{emoji} {r['op_date']} · {money(r['amount'])} · {label}{cat}")
         buttons.append([InlineKeyboardButton(
             text=f"✏️ {r['op_date']} · {money(r['amount'])} · {label}"[:60],
@@ -1019,7 +1058,7 @@ async def cmd_recent(message: Message):
 @router.callback_query(F.data.startswith("recent_page:"))
 async def recent_page_nav(callback: CallbackQuery):
     direction = callback.data.split(":", 1)[1]
-    date_from, date_to, page = LIST_CONTEXT.get(callback.from_user.id, (None, None, 0))
+    date_from, date_to, page = _get_list_context(callback.from_user.id)
     page = page + 1 if direction == "next" else max(0, page - 1)
     text, keyboard = _recent_view(callback.from_user.id, date_from, date_to, page)
     await callback.message.edit_text(text, reply_markup=keyboard)
@@ -1028,7 +1067,7 @@ async def recent_page_nav(callback: CallbackQuery):
 
 @router.callback_query(F.data == "recent_back")
 async def recent_back(callback: CallbackQuery):
-    date_from, date_to, page = LIST_CONTEXT.get(callback.from_user.id, (None, None, 0))
+    date_from, date_to, page = _get_list_context(callback.from_user.id)
     text, keyboard = _recent_view(callback.from_user.id, date_from, date_to, page)
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
@@ -1098,16 +1137,17 @@ async def tx_edit_amount_start(callback: CallbackQuery, state: FSMContext):
 async def tx_edit_amount_apply(message: Message, state: FSMContext):
     data = await state.get_data()
     tx_id = data["edit_tx_id"]
-    try:
-        amount = float(message.text.replace(",", "."))
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
+    amount = parse_positive_amount(message.text)
+    if amount is None:
         await message.answer("Пришли число больше нуля, например: 350")
         return
     db.update_transaction_amount(message.from_user.id, tx_id, amount)
     await state.clear()
     view = _tx_detail_view(message.from_user.id, tx_id)
+    if not view:
+        await message.answer("Операция не найдена (возможно, уже удалена)")
+        await state.clear()
+        return
     text, keyboard = view
     await message.answer(f"✅ Сумма обновлена.\n\n{text}", reply_markup=keyboard)
 
@@ -1123,12 +1163,19 @@ async def tx_edit_desc_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(TransactionEdit.entering_description)
 async def tx_edit_desc_apply(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     data = await state.get_data()
     tx_id = data["edit_tx_id"]
     new_desc = None if message.text.strip() == "-" else message.text.strip()
     db.update_transaction_description(message.from_user.id, tx_id, new_desc)
     await state.clear()
-    text, keyboard = _tx_detail_view(message.from_user.id, tx_id)
+    view = _tx_detail_view(message.from_user.id, tx_id)
+    if not view:
+        await message.answer("Операция не найдена (возможно, уже удалена)")
+        return
+    text, keyboard = view
     await message.answer(f"✅ Описание обновлено.\n\n{text}", reply_markup=keyboard)
 
 
@@ -1155,7 +1202,11 @@ async def tx_edit_category_apply(callback: CallbackQuery):
     if tx and tx["description"]:
         db.learn_category(user_id, tx["description"], int(cat_id))
 
-    text, keyboard = _tx_detail_view(user_id, int(tx_id))
+    view = _tx_detail_view(user_id, int(tx_id))
+    if not view:
+        await callback.answer("Операция не найдена (возможно, уже удалена)", show_alert=True)
+        return
+    text, keyboard = view
     await callback.message.edit_text(f"✅ Категория обновлена (запомнил на будущее).\n\n{text}", reply_markup=keyboard)
     await callback.answer()
 
@@ -1175,7 +1226,11 @@ async def tx_edit_payment_start(callback: CallbackQuery):
 async def tx_edit_payment_apply(callback: CallbackQuery):
     _, tx_id, pm_id = callback.data.split(":")
     db.update_transaction_payment_method(callback.from_user.id, int(tx_id), int(pm_id))
-    text, keyboard = _tx_detail_view(callback.from_user.id, int(tx_id))
+    view = _tx_detail_view(callback.from_user.id, int(tx_id))
+    if not view:
+        await callback.answer("Операция не найдена (возможно, уже удалена)", show_alert=True)
+        return
+    text, keyboard = view
     await callback.message.edit_text(f"✅ Способ оплаты обновлён.\n\n{text}", reply_markup=keyboard)
     await callback.answer()
 
@@ -1199,7 +1254,7 @@ async def tx_delete_confirm(callback: CallbackQuery):
 async def tx_delete_apply(callback: CallbackQuery):
     tx_id = int(callback.data.split(":", 1)[1])
     db.delete_transaction(callback.from_user.id, tx_id)
-    date_from, date_to, page = LIST_CONTEXT.get(callback.from_user.id, (None, None, 0))
+    date_from, date_to, page = _get_list_context(callback.from_user.id)
     text, keyboard = _recent_view(callback.from_user.id, date_from, date_to, page)
     await callback.message.edit_text("✅ Удалено.\n\n" + text, reply_markup=keyboard)
     await callback.answer()
@@ -1259,11 +1314,8 @@ async def bud_pick_category(callback: CallbackQuery, state: FSMContext):
 
 @router.message(BudgetEntry.entering_limit)
 async def bud_enter_limit(message: Message, state: FSMContext):
-    try:
-        limit = float(message.text.replace(",", "."))
-        if limit <= 0:
-            raise ValueError
-    except ValueError:
+    limit = parse_positive_amount(message.text)
+    if limit is None:
         await message.answer("Пришли число больше нуля, например: 100000")
         return
     data = await state.get_data()
@@ -1336,6 +1388,9 @@ async def goal_new_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(GoalEntry.entering_name)
 async def goal_enter_name(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     await state.update_data(goal_name=message.text.strip())
     await state.set_state(GoalEntry.entering_target)
     await message.answer("Сколько нужно накопить (число)?")
@@ -1343,11 +1398,8 @@ async def goal_enter_name(message: Message, state: FSMContext):
 
 @router.message(GoalEntry.entering_target)
 async def goal_enter_target(message: Message, state: FSMContext):
-    try:
-        target = float(message.text.replace(",", "."))
-        if target <= 0:
-            raise ValueError
-    except ValueError:
+    target = parse_positive_amount(message.text)
+    if target is None:
         await message.answer("Пришли число больше нуля, например: 300000")
         return
     data = await state.get_data()
@@ -1368,11 +1420,8 @@ async def goal_contribute_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(GoalContribute.entering_amount)
 async def goal_contribute_apply(message: Message, state: FSMContext):
-    try:
-        amount = float(message.text.replace(",", "."))
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
+    amount = parse_positive_amount(message.text)
+    if amount is None:
         await message.answer("Пришли число больше нуля.")
         return
     data = await state.get_data()
@@ -1472,11 +1521,8 @@ async def rec_choose_type(callback: CallbackQuery, state: FSMContext):
 
 @router.message(RecurringEntry.entering_amount)
 async def rec_enter_amount(message: Message, state: FSMContext):
-    try:
-        amount = float(message.text.replace(",", "."))
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
+    amount = parse_positive_amount(message.text)
+    if amount is None:
         await message.answer("Пришли число больше нуля.")
         return
     await state.update_data(rec_amount=amount)
@@ -1506,6 +1552,9 @@ async def rec_choose_payment(callback: CallbackQuery, state: FSMContext):
 
 @router.message(RecurringEntry.entering_day)
 async def rec_enter_day(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     try:
         day = int(message.text.strip())
         if not (1 <= day <= 28):
@@ -1520,6 +1569,9 @@ async def rec_enter_day(message: Message, state: FSMContext):
 
 @router.message(RecurringEntry.entering_description)
 async def rec_enter_description(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     data = await state.get_data()
     db.add_recurring(
         user_id=message.from_user.id,
@@ -1557,30 +1609,24 @@ async def _recurring_scheduler(bot: Bot):
     """Раз в несколько часов проверяет все активные повторяющиеся платежи и
     создаёт транзакцию, если наступил день месяца и в этом месяце ещё не срабатывал."""
     while True:
-        today = date.today()
-        for r in db.get_all_active_recurring():
-            last_run = date.fromisoformat(r["last_run_date"]) if r["last_run_date"] else None
-            already_ran_this_month = last_run and (last_run.year, last_run.month) == (today.year, today.month)
-            if today.day >= r["day_of_month"] and not already_ran_this_month:
-                db.add_transaction(
-                    user_id=r["user_id"],
-                    tx_type=r["type"],
-                    amount=r["amount"],
-                    category_id=r["category_id"],
-                    payment_method_id=r["payment_method_id"],
-                    store=None,
-                    description=r["description"],
-                    op_date=today.isoformat(),
-                )
-                db.mark_recurring_run(r["id"], today.isoformat())
-                emoji = "💰" if r["type"] == "income" else "💸"
+        try:
+            today = date.today()
+            for r in db.get_all_active_recurring():
                 try:
+                    created = db.apply_due_recurring(r["id"], today.isoformat())
+                    if not created:
+                        continue
+                    emoji = "💰" if r["type"] == "income" else "💸"
                     await bot.send_message(
                         r["user_id"],
                         f"🔁 Автоматически добавлено: {emoji} {money(r['amount'])} — {r['description'] or ''}",
                     )
                 except Exception:
-                    logger.exception("Не удалось уведомить пользователя о повторяющемся платеже")
+                    logger.exception(
+                        "Не удалось обработать повторяющийся платёж %s", r["id"]
+                    )
+        except Exception:
+            logger.exception("Сбой итерации планировщика повторяющихся платежей")
         await asyncio.sleep(6 * 3600)
 
 
@@ -1689,10 +1735,11 @@ async def export_generate(callback: CallbackQuery, state: FSMContext):
         return
 
     if fmt == "csv":
-        buf = export.export_csv(rows)
+        buf = await asyncio.to_thread(export.export_csv, rows)
         filename = f"operations_{date_from}_{date_to}.csv"
     else:
-        buf = export.export_xlsx(rows)
+        # openpyxl на выгрузке за год - это секунды CPU, держать на них loop нельзя
+        buf = await asyncio.to_thread(export.export_xlsx, rows)
         filename = f"operations_{date_from}_{date_to}.xlsx"
 
     await callback.message.edit_text(f"Готово, {len(rows)} операций 👇")
@@ -1706,6 +1753,7 @@ async def export_generate(callback: CallbackQuery, state: FSMContext):
 
 @router.message(Command("language"))
 async def cmd_language(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=name, callback_data=f"lang:{code}")]
         for code, name in LANGUAGES.items()
@@ -1716,6 +1764,7 @@ async def cmd_language(message: Message):
 @router.callback_query(F.data.startswith("lang:"))
 async def set_language(callback: CallbackQuery):
     lang = callback.data.split(":", 1)[1]
+    db.ensure_user(callback.from_user.id, callback.from_user.username)
     db.set_user_language(callback.from_user.id, lang)
     await callback.message.edit_text(t("language_set", lang))
     await callback.answer()
@@ -1731,6 +1780,7 @@ DIGEST_FREQ_LABELS = {"off": "digest_off", "day": "digest_day", "week": "digest_
 
 @router.message(Command("digest"))
 async def cmd_digest(message: Message):
+    db.ensure_user(message.from_user.id, message.from_user.username)
     lang = db.get_user_language(message.from_user.id)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=t(key, lang), callback_data=f"digest_freq:{freq}")]
@@ -1742,6 +1792,7 @@ async def cmd_digest(message: Message):
 @router.callback_query(F.data.startswith("digest_freq:"))
 async def set_digest_freq(callback: CallbackQuery):
     freq = callback.data.split(":", 1)[1]
+    db.ensure_user(callback.from_user.id, callback.from_user.username)
     lang = db.get_user_language(callback.from_user.id)
     db.set_digest_frequency(callback.from_user.id, freq)
     await callback.message.edit_text(t("digest_set", lang, freq=t(DIGEST_FREQ_LABELS[freq], lang)))
@@ -1769,37 +1820,42 @@ async def _digest_scheduler(bot: Bot):
     """Раз в несколько часов проверяет, кому пора прислать автосводку со
     статистикой за месяц и коротким AI-наблюдением."""
     while True:
-        today = date.today()
-        for row in db.get_users_for_digest():
-            if not _digest_due(row["digest_frequency"], row["digest_last_sent"], today):
-                continue
-            user_id = row["user_id"]
-            try:
-                lang = db.get_user_language(user_id)
-                date_from, date_to, label = _period_bounds("month")
-                total_expense = db.get_total_expense(user_id, date_from, date_to)
-                categories_rows = [dict(r) for r in db.get_transactions(user_id, date_from, date_to) if r["type"] == "expense"]
-                cat_totals: dict[str, float] = defaultdict(float)
-                for r in categories_rows:
-                    cat_totals[r["category_name"] or "Без категории"] += r["amount"]
-                top = sorted(cat_totals.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        try:
+            today = date.today()
+            for row in db.get_users_for_digest():
+                try:
+                    if not _digest_due(row["digest_frequency"], row["digest_last_sent"], today):
+                        continue
+                    user_id = row["user_id"]
+                    lang = db.get_user_language(user_id)
+                    freq = row["digest_frequency"]
+                    period = freq if freq in ("day", "week", "month", "year") else "month"
+                    date_from, date_to, label = _period_bounds(period)
+                    total_expense = db.get_total_expense(user_id, date_from, date_to)
+                    categories_rows = [dict(r) for r in db.get_transactions(user_id, date_from, date_to) if r["type"] == "expense"]
+                    cat_totals: dict[str, float] = defaultdict(float)
+                    for r in categories_rows:
+                        cat_totals[r["category_name"] or "Без категории"] += r["amount"]
+                    top = sorted(cat_totals.items(), key=lambda kv: kv[1], reverse=True)[:3]
 
-                text = f"🔔 <b>{t('stats_title', lang, label=label)}</b>\n{t('expenses', lang)}: {money(total_expense)}"
-                if top:
-                    text += "\n\n" + "\n".join(f"• {name}: {money(amount)}" for name, amount in top)
+                    text = f"🔔 <b>{t('stats_title', lang, label=label)}</b>\n{t('expenses', lang)}: {money(total_expense)}"
+                    if top:
+                        text += "\n\n" + "\n".join(f"• {hx(name)}: {money(amount)}" for name, amount in top)
 
-                insight = await asyncio.to_thread(
-                    generate_insight_text,
-                    {"total_expense": total_expense, "top_categories": top},
-                    lang,
-                )
-                if insight:
-                    text += f"\n\n💡 {insight}"
+                    insight = await asyncio.to_thread(
+                        generate_insight_text,
+                        {"total_expense": total_expense, "top_categories": top},
+                        lang,
+                    )
+                    if insight:
+                        text += f"\n\n💡 {insight}"
 
-                await bot.send_message(user_id, text)
-                db.mark_digest_sent(user_id, today.isoformat())
-            except Exception:
-                logger.exception("Не удалось отправить дайджест пользователю %s", user_id)
+                    await bot.send_message(user_id, text)
+                    db.mark_digest_sent(user_id, today.isoformat())
+                except Exception:
+                    logger.exception("Не удалось отправить дайджест пользователю %s", row["user_id"])
+        except Exception:
+            logger.exception("Сбой итерации планировщика дайджестов")
         await asyncio.sleep(6 * 3600)
 
 
@@ -1813,6 +1869,7 @@ def _settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     lang_name = LANGUAGES.get(lang, lang)
     digest_label = t(DIGEST_FREQ_LABELS.get(s["digest_frequency"], "digest_off"), lang)
     idle_on = bool(s["idle_reminder_enabled"])
+    backup_on = bool(s["backup_enabled"])
     bank_on = bool(s["bank_import_enabled"])
 
     text = (
@@ -1820,6 +1877,7 @@ def _settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         f"🌐 Язык: {lang_name}\n"
         f"🔔 Автосводка: {digest_label}\n"
         f"📉 Напоминание о простое: {'включено' if idle_on else 'выключено'}\n"
+        f"📦 Еженедельный автобэкап: {'включён' if backup_on else 'выключен'}\n"
         f"🏦 Импорт из банковских уведомлений: {'включён' if bank_on else 'выключен'}\n"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -1828,6 +1886,10 @@ def _settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         [InlineKeyboardButton(
             text=f"📉 Напоминание: {'выключить' if idle_on else 'включить'}",
             callback_data="settings_toggle_idle",
+        )],
+        [InlineKeyboardButton(
+            text=f"📦 Автобэкап: {'выключить' if backup_on else 'включить'}",
+            callback_data="settings_toggle_backup",
         )],
         [InlineKeyboardButton(
             text=f"🏦 Импорт из банков: {'выключить' if bank_on else 'включить'}",
@@ -1876,6 +1938,20 @@ async def settings_toggle_idle(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "settings_toggle_backup")
+async def settings_toggle_backup(callback: CallbackQuery):
+    s = db.get_settings(callback.from_user.id)
+    new_state = not s["backup_enabled"]
+    db.set_backup_enabled(callback.from_user.id, new_state)
+    text, keyboard = _settings_view(callback.from_user.id)
+    note = (
+        "\n\n📦 Раз в неделю я буду присылать JSON-бэкап в этот чат."
+        if new_state else ""
+    )
+    await callback.message.edit_text(text + note, reply_markup=keyboard)
+    await callback.answer()
+
+
 @router.callback_query(F.data == "settings_toggle_bank")
 async def settings_toggle_bank(callback: CallbackQuery):
     s = db.get_settings(callback.from_user.id)
@@ -1893,10 +1969,24 @@ async def settings_toggle_bank(callback: CallbackQuery):
 
 @router.callback_query(F.data == "settings_backup_now")
 async def settings_backup_now(callback: CallbackQuery):
-    buf = backup.build_backup(callback.from_user.id)
-    await callback.message.answer_document(
-        BufferedInputFile(buf.read(), filename=f"backup_{date.today().isoformat()}.json")
-    )
+    buf = await asyncio.to_thread(backup.build_backup, callback.from_user.id)
+    payload = buf.read()
+    if len(payload) > 45 * 1024 * 1024:
+        await callback.answer("Бэкап слишком большой для Telegram, скачай с сервера", show_alert=True)
+        return
+    try:
+        await callback.message.answer_document(
+            BufferedInputFile(payload, filename=f"backup_{date.today().isoformat()}.json")
+        )
+    except TelegramRetryAfter as exc:
+        await asyncio.sleep(exc.retry_after)
+        await callback.message.answer_document(
+            BufferedInputFile(payload, filename=f"backup_{date.today().isoformat()}.json")
+        )
+    except Exception:
+        logger.exception("Не удалось отправить бэкап")
+        await callback.answer("Не удалось отправить файл", show_alert=True)
+        return
     db.mark_backup_sent(callback.from_user.id, date.today().isoformat())
     await callback.answer("Бэкап отправлен")
 
@@ -1940,7 +2030,7 @@ async def danger_confirm1(callback: CallbackQuery, state: FSMContext):
 @router.message(DangerZone.entering_phrase)
 async def danger_confirm2(message: Message, state: FSMContext):
     await state.clear()
-    if message.text.strip() != "УДАЛИТЬ ВСЁ":
+    if not message.text or message.text.strip() != "УДАЛИТЬ ВСЁ":
         await message.answer("Фраза не совпала - ничего не удалено. Если передумал, это и хорошо.")
         return
     db.delete_all_user_data(message.from_user.id)
@@ -1959,20 +2049,27 @@ async def danger_cancel(callback: CallbackQuery):
 # стоит выше, перед quick_add - см. handle_forwarded_bank_notification)
 # ---------------------------------------------------------------------------
 
-IMPORT_DRAFTS: dict[int, list[dict]] = {}
-
-
-@router.message(F.document, F.document.file_name.regexp(r"\.(csv|xlsx?)$"))
+@router.message(StateFilter(None), F.document, F.document.file_name.regexp(r"\.(csv|xlsx)$"))
 async def handle_import_file(message: Message, bot: Bot):
     user_id = message.from_user.id
     db.ensure_user(user_id, message.from_user.username)
+
+    file_size = message.document.file_size or 0
+    if file_size > MAX_IMPORT_BYTES:
+        await message.answer("⚠️ Файл слишком большой. Максимум 2 МБ.")
+        return
 
     file = await bot.get_file(message.document.file_id)
     buf = io.BytesIO()
     await bot.download_file(file.file_path, destination=buf)
 
     try:
-        rows = export.parse_import_file(buf.getvalue(), message.document.file_name)
+        rows = await asyncio.to_thread(
+            export.parse_import_file, buf.getvalue(), message.document.file_name
+        )
+    except ValueError:
+        await message.answer("⚠️ Слишком много строк в файле (лимит 5000).")
+        return
     except Exception:
         logger.exception("Ошибка разбора импортируемого файла")
         await message.answer("⚠️ Не смог прочитать файл. Поддерживаются CSV и Excel с колонками дата/сумма/описание.")
@@ -1985,13 +2082,17 @@ async def handle_import_file(message: Message, bot: Bot):
         )
         return
 
-    IMPORT_DRAFTS[user_id] = rows
+    import_id = f"{user_id}_{message.message_id}"
+    db.save_state(IMPORT_SCOPE, import_id, rows, user_id=user_id)
     total = sum(r["amount"] for r in rows)
-    preview_lines = [f"• {r['date'] or '—'} — {money(r['amount'])} — {r['description'] or 'без описания'}" for r in rows[:10]]
+    preview_lines = [
+        f"• {hx(r['date']) or '—'} — {money(r['amount'])} — {hx(r['description']) or 'без описания'}"
+        for r in rows[:10]
+    ]
     more = f"\n… и ещё {len(rows) - 10}" if len(rows) > 10 else ""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"✅ Импортировать всё ({len(rows)})", callback_data="import_confirm"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="import_cancel"),
+        InlineKeyboardButton(text=f"✅ Импортировать всё ({len(rows)})", callback_data=f"imp_ok:{message.message_id}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"imp_no:{message.message_id}"),
     ]])
     await message.answer(
         f"📤 Нашёл {len(rows)} операций на общую сумму {money(total)}:\n\n"
@@ -2000,29 +2101,40 @@ async def handle_import_file(message: Message, bot: Bot):
     )
 
 
-@router.callback_query(F.data == "import_confirm")
+@router.callback_query(F.data.startswith("imp_ok:"))
 async def import_confirm(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    rows = IMPORT_DRAFTS.pop(user_id, [])
-    if not rows:
-        await callback.answer("Черновик устарел", show_alert=True)
-        return
-    pm_id = db.get_default_payment_method_id(user_id)
-    for r in rows:
-        cat_name = await asyncio.to_thread(categorize_smart, user_id, r["description"] or "")
-        cat_id = db.get_category_id_by_name(user_id, cat_name)
-        db.add_transaction(
-            user_id=user_id, tx_type=r["type"], amount=r["amount"], category_id=cat_id,
-            payment_method_id=pm_id, store=None, description=r["description"],
-            op_date=r["date"] or date.today().isoformat(),
-        )
-    await callback.message.edit_text(f"✅ Импортировано {len(rows)} операций.")
     await callback.answer()
+    user_id = callback.from_user.id
+    message_id = callback.data.split(":", 1)[1]
+    import_id = f"{user_id}_{message_id}"
+    rows = db.load_state(IMPORT_SCOPE, import_id, default=[])
+    if not rows:
+        await callback.message.edit_text("Черновик устарел")
+        return
+    names = [r["description"] or "" for r in rows]
+    cat_names = await asyncio.to_thread(categorize_many, user_id, names)
+    for row, cat_name in zip(rows, cat_names):
+        row["category"] = cat_name
+    db.save_state(IMPORT_SCOPE, import_id, rows, user_id=user_id)
+    pm_id = db.get_default_payment_method_id(user_id)
+    count = await asyncio.to_thread(
+        db.commit_import_draft,
+        user_id,
+        import_id,
+        pm_id,
+        date.today().isoformat(),
+    )
+    if count is None:
+        await callback.message.edit_text("Черновик устарел")
+        return
+    await callback.message.edit_text(f"✅ Импортировано {count} операций.")
 
 
-@router.callback_query(F.data == "import_cancel")
+@router.callback_query(F.data.startswith("imp_no:"))
 async def import_cancel(callback: CallbackQuery):
-    IMPORT_DRAFTS.pop(callback.from_user.id, None)
+    user_id = callback.from_user.id
+    message_id = callback.data.split(":", 1)[1]
+    db.delete_state(IMPORT_SCOPE, f"{user_id}_{message_id}", user_id=user_id)
     await callback.message.edit_text("❌ Импорт отменён.")
     await callback.answer()
 
@@ -2033,46 +2145,55 @@ async def import_cancel(callback: CallbackQuery):
 
 async def _idle_reminder_scheduler(bot: Bot):
     while True:
-        today = date.today()
-        for row in db.get_users_for_idle_check():
-            last_activity = date.fromisoformat(row["last_activity_date"]) if row["last_activity_date"] else None
-            if last_activity and (today - last_activity).days < 3:
-                continue
-            last_sent = date.fromisoformat(row["idle_reminder_last_sent"]) if row["idle_reminder_last_sent"] else None
-            if last_sent and (today - last_sent).days < 3:
-                continue  # не спамим чаще раза в 3 дня
-            try:
-                await bot.send_message(
-                    row["user_id"],
-                    "👋 Давно не было новых записей. Всё в порядке? Если что - "
-                    "просто напиши сумму и что купил, займёт секунду."
-                )
-                db.mark_idle_reminder_sent(row["user_id"], today.isoformat())
-            except Exception:
-                logger.exception("Не удалось отправить напоминание о простое пользователю %s", row["user_id"])
+        try:
+            purged = db.purge_stale_state()
+            if purged:
+                logger.info("Периодическая очистка app_state: %s", purged)
+            today = date.today()
+            for row in db.get_users_for_idle_check():
+                try:
+                    last_activity = date.fromisoformat(row["last_activity_date"]) if row["last_activity_date"] else None
+                    if last_activity is None or (today - last_activity).days < 3:
+                        continue
+                    last_sent = date.fromisoformat(row["idle_reminder_last_sent"]) if row["idle_reminder_last_sent"] else None
+                    if last_sent and (today - last_sent).days < 3:
+                        continue
+                    await bot.send_message(
+                        row["user_id"],
+                        "👋 Давно не было новых записей. Всё в порядке? Если что - "
+                        "просто напиши сумму и что купил, займёт секунду."
+                    )
+                    db.mark_idle_reminder_sent(row["user_id"], today.isoformat())
+                except Exception:
+                    logger.exception("Не удалось отправить напоминание о простое пользователю %s", row["user_id"])
+        except Exception:
+            logger.exception("Сбой итерации планировщика напоминаний о простое")
         await asyncio.sleep(12 * 3600)
 
 
 async def _backup_scheduler(bot: Bot):
     while True:
-        today = date.today()
-        for row in db.get_users_for_backup():
-            last_sent = date.fromisoformat(row["backup_last_sent"]) if row["backup_last_sent"] else None
-            if last_sent and (today - last_sent).days < 7:
-                continue
-            user_id = row["user_id"]
-            if db.count_user_data(user_id) == 0:
-                continue  # нечего бэкапить
-            try:
-                buf = backup.build_backup(user_id)
-                await bot.send_document(
-                    user_id,
-                    BufferedInputFile(buf.read(), filename=f"backup_{today.isoformat()}.json"),
-                    caption="📦 Еженедельный автобэкап твоих данных",
-                )
-                db.mark_backup_sent(user_id, today.isoformat())
-            except Exception:
-                logger.exception("Не удалось отправить автобэкап пользователю %s", user_id)
+        try:
+            today = date.today()
+            for row in db.get_users_for_backup():
+                try:
+                    last_sent = date.fromisoformat(row["backup_last_sent"]) if row["backup_last_sent"] else None
+                    if last_sent and (today - last_sent).days < 7:
+                        continue
+                    user_id = row["user_id"]
+                    if db.count_user_data(user_id) == 0:
+                        continue
+                    buf = await asyncio.to_thread(backup.build_backup, user_id)
+                    await bot.send_document(
+                        user_id,
+                        BufferedInputFile(buf.read(), filename=f"backup_{today.isoformat()}.json"),
+                        caption="📦 Еженедельный автобэкап твоих данных",
+                    )
+                    db.mark_backup_sent(user_id, today.isoformat())
+                except Exception:
+                    logger.exception("Не удалось отправить автобэкап пользователю %s", row["user_id"])
+        except Exception:
+            logger.exception("Сбой итерации планировщика бэкапов")
         await asyncio.sleep(24 * 3600)
 
 
@@ -2097,13 +2218,16 @@ async def cmd_feedback(message: Message, state: FSMContext):
 
 @router.message(FeedbackEntry.entering_text)
 async def feedback_send(message: Message, state: FSMContext, bot: Bot):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
     await state.clear()
     user = message.from_user
     username = f"@{user.username}" if user.username else user.full_name
     try:
         await bot.send_message(
             ADMIN_USER_ID,
-            f"📩 <b>Фидбэк от {username}</b> (id {user.id}):\n\n{message.text}",
+            f"📩 <b>Фидбэк от {hx(username)}</b> (id {user.id}):\n\n{hx(message.text)}",
         )
         await message.answer("✅ Отправлено, спасибо!")
     except Exception:
@@ -2123,16 +2247,38 @@ async def main():
         )
 
     db.init_db()
+    purged = db.purge_stale_state()
+    if purged:
+        logger.info("Удалено брошенных черновиков и FSM-сессий: %s", purged)
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=SQLiteStorage())
     dp.include_router(router)
 
-    asyncio.create_task(_recurring_scheduler(bot))
-    asyncio.create_task(_digest_scheduler(bot))
-    asyncio.create_task(_idle_reminder_scheduler(bot))
-    asyncio.create_task(_backup_scheduler(bot))
+    asyncio.create_task(_run_supervised(bot))
     await dp.start_polling(bot)
+
+
+async def _supervised(name: str, factory, bot: Bot) -> None:
+    while True:
+        try:
+            await factory(bot)
+            logger.error("Фоновая задача %s завершилась, перезапускаю", name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Фоновая задача %s упала, перезапускаю", name)
+        await asyncio.sleep(30)
+
+
+async def _run_supervised(bot: Bot) -> None:
+    BACKGROUND_TASKS[:] = [
+        asyncio.create_task(_supervised("recurring", _recurring_scheduler, bot), name="recurring"),
+        asyncio.create_task(_supervised("digest", _digest_scheduler, bot), name="digest"),
+        asyncio.create_task(_supervised("idle", _idle_reminder_scheduler, bot), name="idle"),
+        asyncio.create_task(_supervised("backup", _backup_scheduler, bot), name="backup"),
+    ]
+    await asyncio.gather(*BACKGROUND_TASKS)
 
 
 if __name__ == "__main__":

@@ -85,4 +85,8 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 
 # Твой Telegram user_id - сюда будет приходить фидбэк от /feedback.
 # Узнать свой id можно у бота @userinfobot.
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0")) or None
+try:
+    _admin_raw = os.getenv("ADMIN_USER_ID", "0")
+    ADMIN_USER_ID = int(_admin_raw) or None
+except ValueError:
+    ADMIN_USER_ID = None

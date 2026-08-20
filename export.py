@@ -6,6 +6,7 @@ import io
 from openpyxl import Workbook
 
 HEADERS = ["Дата", "Время", "Тип", "Сумма", "Категория", "Способ оплаты", "Магазин", "Описание"]
+MAX_IMPORT_ROWS = 5000
 
 
 def _row_values(r: dict) -> list:
@@ -93,21 +94,39 @@ def _parse_date_cell(value) -> str | None:
     return None
 
 
+def _decode_csv_bytes(file_bytes: bytes) -> str:
+    for encoding in ("utf-8-sig", "cp1251"):
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("cp1251", errors="replace")
+
+
 def parse_import_file(file_bytes: bytes, filename: str) -> list[dict]:
     """Пытается вытащить дата/сумма/описание из чужого CSV/Excel по заголовкам
     колонок. Возвращает список найденных строк - вызывающий код обязательно
     должен показать превью перед сохранением, точность не гарантируется."""
     rows_raw: list[list] = []
 
-    if filename.lower().endswith((".xlsx", ".xls")):
+    if filename.lower().endswith(".xlsx"):
         wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
         ws = wb.active
         for row in ws.iter_rows(values_only=True):
             rows_raw.append(list(row))
+            if len(rows_raw) > MAX_IMPORT_ROWS + 1:
+                raise ValueError("too many rows")
     else:
-        text = file_bytes.decode("utf-8-sig", errors="ignore")
-        reader = csv.reader(io.StringIO(text))
-        rows_raw = [row for row in reader]
+        text = _decode_csv_bytes(file_bytes)
+        try:
+            dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.reader(io.StringIO(text), dialect)
+        for row in reader:
+            rows_raw.append(row)
+            if len(rows_raw) > MAX_IMPORT_ROWS + 1:
+                raise ValueError("too many rows")
 
     if not rows_raw:
         return []

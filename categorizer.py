@@ -33,41 +33,47 @@ def categorize(item_name: str, categories_keywords: dict[str, list[str]] | None 
     return best_category
 
 
-def categorize_smart(user_id: int, item_name: str) -> str:
-    """Три уровня, по порядку:
-    1) Слово уже было один раз исправлено пользователем вручную - используем
-       запомненную категорию (быстро, бесплатно, 100% предсказуемо).
-    2) Локальный словарь ключевых слов (быстро, бесплатно).
-    3) Только если словарь не справился (результат - "Прочее") - спрашиваем
-       ИИ (Gemini), и если он дал уверенный ответ, ЗАПОМИНАЕМ его как выученное
-       слово, чтобы в следующий раз не тратить время/запрос на тот же товар.
-    """
+def categorize_many(user_id: int, item_names: list[str]) -> list[str]:
+    """Категории для списка названий. Неизвестные товары — один вызов Gemini."""
     import db
-    from gemini_engine import guess_category_ai
-
-    normalized = item_name.strip().lower()
-
-    learned = db.get_learned_category_name(user_id, normalized)
-    if learned:
-        return learned
-
-    result = categorize(item_name)
-    if result != "Прочее":
-        return result
+    from gemini_engine import guess_categories_ai
 
     category_names = [c["name"] for c in db.get_categories(user_id)]
-    ai_guess = guess_category_ai(item_name, category_names)
-    if ai_guess and ai_guess in category_names:
-        cat_id = db.get_category_id_by_name(user_id, ai_guess)
-        if cat_id:
-            db.learn_category(user_id, normalized, cat_id)
-        return ai_guess
+    results: list[str | None] = [None] * len(item_names)
+    unknown: list[tuple[int, str]] = []
 
-    return "Прочее"
+    for index, item_name in enumerate(item_names):
+        normalized = (item_name or "").strip().lower()
+        if not normalized:
+            results[index] = "Прочее"
+            continue
+        learned = db.get_learned_category_name(user_id, normalized)
+        if learned:
+            results[index] = learned
+            continue
+        local = categorize(item_name)
+        if local != "Прочее":
+            results[index] = local
+            continue
+        unknown.append((index, item_name))
+
+    if unknown:
+        guesses = guess_categories_ai([name for _, name in unknown], category_names)
+        for index, item_name in unknown:
+            guess = guesses.get(item_name)
+            if guess and guess in category_names:
+                results[index] = guess
+            else:
+                results[index] = "Прочее"
+
+    return [name or "Прочее" for name in results]
+
+
+def categorize_smart(user_id: int, item_name: str) -> str:
+    return categorize_many(user_id, [item_name])[0]
 
 
 if __name__ == "__main__":
-    # Быстрый самотест
     tests = [
         "Молоко Простоквашино 3.2% 930мл",
         "Такси Яндекс Go поездка",

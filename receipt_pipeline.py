@@ -8,7 +8,7 @@
 
 import logging
 
-from categorizer import categorize_smart
+from categorizer import categorize_many
 from gemini_engine import get_receipt_from_gemini
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ def extract_receipt(image_path: str, user_id: int) -> dict:
 
 
 def _categorize_items(parsed: dict, user_id: int) -> None:
-    """Категоризация каждого товара: сначала выученные слова пользователя,
-    потом локальный словарь, и только если оба не справились - ИИ-резерв."""
-    for item in parsed["items"]:
-        item.setdefault("category", categorize_smart(user_id, item["name"]))
+    names = [item.get("name") or "" for item in parsed["items"]]
+    categories = categorize_many(user_id, names)
+    for item, category in zip(parsed["items"], categories):
+        item.setdefault("category", category)

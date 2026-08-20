@@ -11,6 +11,10 @@
 import base64
 import json
 import logging
+import math
+import re
+import time
+from datetime import date, datetime
 
 import requests
 
@@ -40,12 +44,137 @@ PROMPT = """Ты распознаёшь кассовый чек на фото. �
 
 
 def _guess_mime_type(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        header = f.read(12)
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return "image/webp"
+    if header.startswith(b"\xff\xd8"):
+        return "image/jpeg"
     lower = image_path.lower()
     if lower.endswith(".png"):
         return "image/png"
     if lower.endswith(".webp"):
         return "image/webp"
     return "image/jpeg"
+
+
+def _parse_item_price(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if math.isfinite(number) and number > 0:
+            return number
+        return None
+    text = str(value).strip().replace(" ", "").replace("\u00a0", "").replace(",", ".")
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    if math.isfinite(number) and number > 0:
+        return number
+    return None
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIME_RE = re.compile(r"^\d{2}:\d{2}(?::\d{2})?$")
+_MAX_NAME = 200
+_MAX_STORE = 120
+_MAX_ITEMS = 80
+
+
+def _optional_str(value, max_len: int) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "null":
+        return None
+    return text[:max_len]
+
+
+def _parse_iso_date(value) -> str | None:
+    text = _optional_str(value, 32)
+    if not text or not _DATE_RE.match(text):
+        return None
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return None
+    return text
+
+
+def _parse_iso_time(value) -> str | None:
+    text = _optional_str(value, 16)
+    if not text or not _TIME_RE.match(text):
+        return None
+    try:
+        datetime.strptime(text[:5], "%H:%M")
+    except ValueError:
+        return None
+    return text[:5]
+
+
+def sanitize_gemini_receipt(data: dict) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list):
+        return None
+    items = []
+    for it in raw_items[:_MAX_ITEMS]:
+        if not isinstance(it, dict):
+            continue
+        name = _optional_str(it.get("name"), _MAX_NAME)
+        price = _parse_item_price(it.get("price"))
+        if name and price is not None:
+            items.append({"name": name, "price": price})
+    if not items:
+        return None
+    total = _parse_item_price(data.get("total"))
+    item_sum = sum(item["price"] for item in items)
+    if total is None:
+        total = item_sum
+    return {
+        "store": _optional_str(data.get("store"), _MAX_STORE),
+        "date": _parse_iso_date(data.get("date")),
+        "time": _parse_iso_time(data.get("time")),
+        "items": items,
+        "total": total,
+        "raw_text": f"[распознано Gemini {GEMINI_MODEL}]",
+        "source": "gemini",
+    }
+
+
+def _post_gemini(body: dict) -> dict | None:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+            if response.status_code in (429, 500, 502, 503, 504):
+                last_error = response.status_code
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if not response.ok:
+                logger.error(
+                    "Gemini API вернул %s: %s", response.status_code, response.text[:500]
+                )
+                return None
+            return response.json()
+        except requests.RequestException:
+            logger.exception("Сеть Gemini, попытка %s", attempt + 1)
+            time.sleep(1.5 * (attempt + 1))
+    if last_error:
+        logger.error("Gemini недоступен после повторов, последний код %s", last_error)
+    return None
 
 
 def get_receipt_from_gemini(image_path: str) -> dict | None:
@@ -56,14 +185,7 @@ def get_receipt_from_gemini(image_path: str) -> dict | None:
     with open(image_path, "rb") as f:
         image_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    # Ключ передаём заголовком x-goog-api-key, а не ?key= в URL - это текущий
-    # официальный способ, актуальный в том числе для новых Auth-ключей формата
-    # "AQ.Ab..." (пришли на смену старым "AIzaSy...").
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
-    }
+    # Ключ передаём заголовком x-goog-api-key, а не ?key= в URL.
     body = {
         "contents": [
             {
@@ -75,78 +197,70 @@ def get_receipt_from_gemini(image_path: str) -> dict | None:
         ],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "temperature": 0.1,  # низкая температура - меньше "фантазий", больше точности
+            "temperature": 0.1,
         },
     }
 
+    payload = _post_gemini(body)
+    if not payload:
+        return None
     try:
-        response = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-        if not response.ok:
-            # Логируем тело ответа - там обычно точная причина (неверный ключ,
-            # не включён API, неверное имя модели и т.д.), а не просто код 404/403
-            logger.error(
-                "Gemini API вернул %s: %s", response.status_code, response.text[:500]
-            )
-            return None
-        payload = response.json()
         text = payload["candidates"][0]["content"]["parts"][0]["text"]
         data = json.loads(text)
-    except Exception:
-        logger.exception("Ошибка запроса к Gemini API")
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        logger.exception("Некорректный ответ Gemini")
         return None
-
-    items = [
-        {"name": str(it.get("name", "")).strip(), "price": float(it.get("price", 0))}
-        for it in data.get("items", [])
-        if it.get("name") and it.get("price") is not None
-    ]
-    if not items:
-        return None
-
-    return {
-        "store": data.get("store"),
-        "date": data.get("date"),
-        "time": data.get("time"),
-        "items": items,
-        "total": data.get("total"),
-        "raw_text": f"[распознано Gemini {GEMINI_MODEL}]",
-        "source": "gemini",
-    }
+    return sanitize_gemini_receipt(data)
 
 
 def _text_request(prompt: str, max_tokens: int = 200) -> str | None:
     """Общая обёртка для текстовых (не по фото) запросов к Gemini."""
     if not GEMINI_API_KEY:
         return None
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
     }
+    payload = _post_gemini(body)
+    if not payload:
+        return None
     try:
-        response = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-        if not response.ok:
-            logger.error("Gemini text API вернул %s: %s", response.status_code, response.text[:300])
-            return None
-        payload = response.json()
         return payload["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception:
-        logger.exception("Ошибка текстового запроса к Gemini")
+    except (KeyError, IndexError, TypeError):
         return None
 
 
-def guess_category_ai(item_name: str, category_names: list[str]) -> str | None:
-    """Вызывается ТОЛЬКО когда локальный словарь категорий не справился
-    (вернул "Прочее") - последний резерв перед тем как сдаться окончательно."""
+def guess_categories_ai(item_names: list[str], category_names: list[str]) -> dict[str, str]:
+    """Один запрос на пачку неизвестных товаров вместо N+1."""
+    if not item_names:
+        return {}
+    numbered = "\n".join(f"{i+1}. {name}" for i, name in enumerate(item_names[:80]))
     prompt = (
-        f"Товар: \"{item_name}\"\n"
-        f"Выбери ОДНУ наиболее подходящую категорию строго из списка "
-        f"(ответь только названием категории, без пояснений):\n"
-        f"{', '.join(category_names)}"
+        f"Категории (только из этого списка): {', '.join(category_names)}\n"
+        f"Товары:\n{numbered}\n"
+        "Верни JSON-объект, где ключ - номер товара (строка), значение - "
+        "название категории из списка. Без пояснений."
     )
-    result = _text_request(prompt, max_tokens=20)
-    return result.strip() if result else None
+    result = _text_request(prompt, max_tokens=400)
+    if not result:
+        return {}
+    try:
+        data = json.loads(result)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    allowed = set(category_names)
+    mapped = {}
+    for i, name in enumerate(item_names[:80], start=1):
+        guess = data.get(str(i)) or data.get(i)
+        if isinstance(guess, str) and guess in allowed:
+            mapped[name] = guess
+    return mapped
+
+
+def guess_category_ai(item_name: str, category_names: list[str]) -> str | None:
+    return guess_categories_ai([item_name], category_names).get(item_name)
 
 
 def generate_insight_text(summary: dict, lang: str = "ru") -> str | None:
