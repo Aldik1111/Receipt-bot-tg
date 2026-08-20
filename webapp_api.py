@@ -28,7 +28,31 @@ routes = web.RouteTableDef()
 def _authenticate(request: web.Request) -> int | None:
     init_data = request.headers.get("X-Telegram-Init-Data", "")
     user = validate_init_data(init_data, BOT_TOKEN)
-    return user["id"] if user else None
+    if not user:
+        return None
+    db.ensure_user(user["id"], user.get("username"))
+    return user["id"]
+
+
+def _parse_custom_dates(request: web.Request) -> tuple[str, str] | web.Response | None:
+    date_from = request.query.get("date_from")
+    date_to = request.query.get("date_to")
+    if not date_from and not date_to:
+        return None
+    if bool(date_from) != bool(date_to):
+        return web.json_response(
+            {"error": "date_from and date_to must be provided together"}, status=400
+        )
+    try:
+        start = date.fromisoformat(date_from)
+        end = date.fromisoformat(date_to)
+    except ValueError:
+        return web.json_response({"error": "invalid date format"}, status=400)
+    if start > end:
+        return web.json_response(
+            {"error": "date_from must not be after date_to"}, status=400
+        )
+    return date_from, date_to
 
 
 def _period_bounds(period: str) -> tuple[str, str]:
@@ -36,7 +60,12 @@ def _period_bounds(period: str) -> tuple[str, str]:
     if period == "week":
         start = today - timedelta(days=today.weekday())
     elif period == "3months":
-        start = (today.replace(day=1) - timedelta(days=62)).replace(day=1)
+        month = today.month - 2
+        year = today.year
+        while month <= 0:
+            month += 12
+            year -= 1
+        start = date(year, month, 1)
     elif period == "year":
         start = today.replace(month=1, day=1)
     else:  # month по умолчанию
@@ -64,8 +93,11 @@ async def get_summary(request: web.Request) -> web.Response:
         return web.json_response({"error": "unauthorized"}, status=401)
 
     period = request.query.get("period", "month")
-    if request.query.get("date_from") and request.query.get("date_to"):
-        date_from, date_to = request.query["date_from"], request.query["date_to"]
+    parsed = _parse_custom_dates(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    if parsed:
+        date_from, date_to = parsed
     else:
         date_from, date_to = _period_bounds(period)
     rows = db.get_transactions(user_id, date_from, date_to)
@@ -91,8 +123,11 @@ async def get_categories_breakdown(request: web.Request) -> web.Response:
         return web.json_response({"error": "unauthorized"}, status=401)
 
     period = request.query.get("period", "month")
-    if request.query.get("date_from") and request.query.get("date_to"):
-        date_from, date_to = request.query["date_from"], request.query["date_to"]
+    parsed = _parse_custom_dates(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    if parsed:
+        date_from, date_to = parsed
     else:
         date_from, date_to = _period_bounds(period)
     rows = db.get_transactions(user_id, date_from, date_to)
@@ -130,17 +165,44 @@ async def get_transactions_list(request: web.Request) -> web.Response:
     if not user_id:
         return web.json_response({"error": "unauthorized"}, status=401)
 
-    limit = min(int(request.query.get("limit", 50)), 200)
-    offset = int(request.query.get("offset", 0))
+    try:
+        limit = int(request.query.get("limit", 50))
+        offset = int(request.query.get("offset", 0))
+    except ValueError:
+        return web.json_response(
+            {"error": "limit and offset must be integers"}, status=400
+        )
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
     date_from = request.query.get("date_from")
     date_to = request.query.get("date_to")
     category = request.query.get("category")
+    parsed = _parse_custom_dates(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    if parsed:
+        date_from, date_to = parsed
+    elif request.query.get("period"):
+        # Mini App использует period, а не явные даты. Раньше endpoint его
+        # игнорировал: карточки были за месяц, список операций — за всё время.
+        date_from, date_to = _period_bounds(request.query["period"])
 
-    rows = db.get_recent_transactions(user_id, limit=500, offset=0, date_from=date_from, date_to=date_to)
-    if category and category != "all":
-        rows = [r for r in rows if r["category_name"] == category]
-    total_count = len(rows)
-    rows = rows[offset:offset + limit]
+    category_name = category if category and category != "all" else None
+    rows = db.get_recent_transactions(
+        user_id,
+        limit=limit,
+        offset=offset,
+        date_from=date_from,
+        date_to=date_to,
+        category_name=category_name,
+    )
+    total_count = db.count_all_transactions(
+        user_id,
+        date_from=date_from,
+        date_to=date_to,
+        category_name=category_name,
+    )
 
     items = [{
         "id": r["id"],

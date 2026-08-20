@@ -1,4 +1,4 @@
-"""
+п"""
 Проверка подлинности initData, которую Mini App присылает на каждый запрос.
 
 Telegram подписывает initData HMAC-подписью на основе токена бота, поэтому
@@ -13,7 +13,8 @@ import json
 import time
 from urllib.parse import parse_qsl
 
-MAX_AGE_SECONDS = 24 * 3600  # старше суток initData не принимаем (защита от replay)
+MAX_AGE_SECONDS = 3600  # старше часа initData не принимаем (защита от replay)
+MAX_FUTURE_SKEW_SECONDS = 30  # небольшой допустимый рассинхрон часов сервера
 
 
 def validate_init_data(init_data: str, bot_token: str) -> dict | None:
@@ -34,11 +35,21 @@ def validate_init_data(init_data: str, bot_token: str) -> dict | None:
     if not hmac.compare_digest(computed_hash, received_hash):
         return None
 
-    auth_date = int(pairs.get("auth_date", 0))
-    if time.time() - auth_date > MAX_AGE_SECONDS:
+    try:
+        auth_date = int(pairs.get("auth_date", 0))
+    except (TypeError, ValueError):
+        return None
+    age = time.time() - auth_date
+    if age > MAX_AGE_SECONDS or age < -MAX_FUTURE_SKEW_SECONDS:
         return None
 
     user_raw = pairs.get("user")
     if not user_raw:
         return None
-    return json.loads(user_raw)
+    try:
+        user = json.loads(user_raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(user, dict) or not isinstance(user.get("id"), int):
+        return None
+    return user

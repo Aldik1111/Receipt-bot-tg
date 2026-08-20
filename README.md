@@ -218,12 +218,9 @@ systemd-сервисом решит задачу так же надёжно.
 
 ## Возможные следующие шаги (когда захочешь развивать проект)
 
-- Редактирование отдельных позиций чека перед сохранением (сейчас — только
-  "сохранить всё" или "отменить всё").
-- Telegram Mini App для более наглядной статистики (графики, фильтры) —
-  само API уже даёт все нужные данные через `db.get_transactions()`.
-- Лимиты по категориям с уведомлениями о приближении к бюджету.
-- Экспорт в CSV/Excel.
+- Редактирование позиций чека до сохранения (сейчас позиции правятся уже после записи).
+- Часовой пояс пользователя вместо времени сервера.
+- Покрытие хендлеров Telegram автотестами.
 
 ## Mini App (веб-дашборд внутри Telegram)
 
@@ -256,7 +253,8 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl ensudo systemctl status receipt-botable --now receipt-webapp
+sudo systemctl enable --now receipt-webapp
+sudo systemctl status receipt-webapp
 ```
 
 3. Caddyfile (см. пример выше в разделе про хостинг) проксирует `/api/*` на

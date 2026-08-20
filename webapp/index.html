@@ -4,8 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Бюджет</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://telegram.org https://cdn.jsdelivr.net 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; object-src 'none'; form-action 'none';">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" integrity="sha384-NrKB+u6Ts6AtkIhwPixiKTzgSKNblyhlk0Sohlgar9UHUBzai/sgnNNWWd291xqt" crossorigin="anonymous"></script>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -95,7 +96,12 @@
 
   <div class="section-title">Операции</div>
   <div class="card" id="transactions-list"></div>
+  <div id="tx-pager" class="tabs" style="display:none;margin-top:8px">
+    <button class="tab" id="tx-prev" type="button">Назад</button>
+    <button class="tab" id="tx-next" type="button">Ещё</button>
+  </div>
 </div>
+<div id="app-error" class="empty" style="display:none"></div>
 
 <div id="view-budgets" style="display:none">
   <div class="card" id="budgets-list"></div>
@@ -114,6 +120,20 @@ let currentTab = "overview";
 let currentPeriod = "month";
 let currentCategory = "all";
 let chart = null;
+let txOffset = 0;
+const TX_PAGE = 50;
+
+function setText(id, value) {
+  document.getElementById(id).textContent = value == null ? "" : String(value);
+}
+
+function setEmpty(el, text) {
+  el.replaceChildren();
+  const empty = document.createElement("div");
+  empty.className = "empty";
+  empty.textContent = text;
+  el.appendChild(empty);
+}
 
 async function api(path) {
   const res = await fetch(path, { headers: { "X-Telegram-Init-Data": initData } });
@@ -124,8 +144,17 @@ async function api(path) {
 async function loadCategoryFilter() {
   const data = await api("/api/category_list");
   const select = document.getElementById("category-filter");
-  select.innerHTML = '<option value="all">Все категории</option>' +
-    data.items.map(c => `<option value="${encodeURIComponent(c.name)}">${c.emoji} ${c.name}</option>`).join("");
+  select.replaceChildren();
+  const all = document.createElement("option");
+  all.value = "all";
+  all.textContent = "Все категории";
+  select.appendChild(all);
+  (data.items || []).forEach(c => {
+    const opt = document.createElement("option");
+    opt.value = encodeURIComponent(c.name);
+    opt.textContent = `${c.emoji || ""} ${c.name || ""}`.trim();
+    select.appendChild(opt);
+  });
 }
 
 async function loadOverview() {
@@ -133,12 +162,12 @@ async function loadOverview() {
   const [summary, categories, transactions] = await Promise.all([
     api(`/api/summary?period=${currentPeriod}`),
     api(`/api/categories?period=${currentPeriod}`),
-    api(`/api/transactions?period=${currentPeriod}${catParam}&limit=50`),
+    api(`/api/transactions?period=${currentPeriod}${catParam}&limit=${TX_PAGE}&offset=${txOffset}`),
   ]);
 
-  document.getElementById("expense-value").textContent = summary.expense_formatted;
-  document.getElementById("income-value").textContent = summary.income_formatted;
-  document.getElementById("balance-value").textContent = summary.balance_formatted;
+  setText("expense-value", summary.expense_formatted);
+  setText("income-value", summary.income_formatted);
+  setText("balance-value", summary.balance_formatted);
 
   const ctx = document.getElementById("category-chart");
   const labels = categories.items.map(i => `${i.emoji} ${i.category}`);
@@ -158,65 +187,110 @@ async function loadOverview() {
 
   const listEl = document.getElementById("transactions-list");
   if (transactions.items.length === 0) {
-    listEl.innerHTML = '<div class="empty">Операций не найдено</div>';
+    setEmpty(listEl, "Операций не найдено");
   } else {
-    listEl.innerHTML = transactions.items.map(t => `
-      <div class="list-item">
-        <div class="left">
-          <span>${t.description || t.store || "без описания"}</span>
-          <span class="cat">${t.date} · ${t.category_emoji || "🏷"} ${t.category || "—"}</span>
-        </div>
-        <span>${t.type === "income" ? "+" : "-"}${t.amount_formatted}</span>
-      </div>
-    `).join("");
+    listEl.replaceChildren();
+    transactions.items.forEach(t => {
+      const item = document.createElement("div");
+      item.className = "list-item";
+      const left = document.createElement("div");
+      left.className = "left";
+      const title = document.createElement("span");
+      title.textContent = t.description || t.store || "без описания";
+      const cat = document.createElement("span");
+      cat.className = "cat";
+      cat.textContent = `${t.date} · ${t.category_emoji || "🏷"} ${t.category || "—"}`;
+      left.append(title, cat);
+      const amount = document.createElement("span");
+      amount.textContent = `${t.type === "income" ? "+" : "-"}${t.amount_formatted}`;
+      item.append(left, amount);
+      listEl.appendChild(item);
+    });
   }
+  const pager = document.getElementById("tx-pager");
+  const total = Number(transactions.total) || 0;
+  pager.style.display = total > TX_PAGE ? "flex" : "none";
+  document.getElementById("tx-prev").disabled = txOffset <= 0;
+  document.getElementById("tx-next").disabled = txOffset + TX_PAGE >= total;
 }
 
 async function loadBudgets() {
   const data = await api("/api/budgets");
   const el = document.getElementById("budgets-list");
   if (data.items.length === 0) {
-    el.innerHTML = '<div class="empty">Лимиты не заданы</div>';
+    setEmpty(el, "Лимиты не заданы");
     return;
   }
-  el.innerHTML = data.items.map(b => {
-    const color = b.pct >= 100 ? "#e53935" : (b.pct >= 80 ? "#fb8c00" : "#43a047");
-    return `
-      <div style="margin-bottom:14px">
-        <div class="list-item" style="border:none;padding:2px 0">
-          <span>${b.category}</span>
-          <span>${b.spent_formatted} / ${b.limit_formatted}</span>
-        </div>
-        <div class="bar-bg"><div class="bar-fill" style="width:${Math.min(b.pct,100)}%;background:${color}"></div></div>
-      </div>`;
-  }).join("");
+  el.replaceChildren();
+  data.items.forEach(b => {
+    const wrap = document.createElement("div");
+    wrap.style.marginBottom = "14px";
+    const row = document.createElement("div");
+    row.className = "list-item";
+    row.style.border = "none";
+    row.style.padding = "2px 0";
+    const name = document.createElement("span");
+    name.textContent = b.category;
+    const nums = document.createElement("span");
+    nums.textContent = `${b.spent_formatted} / ${b.limit_formatted}`;
+    row.append(name, nums);
+    const barBg = document.createElement("div");
+    barBg.className = "bar-bg";
+    const barFill = document.createElement("div");
+    barFill.className = "bar-fill";
+    const pct = Number(b.pct);
+    barFill.style.width = `${Math.min(Number.isFinite(pct) ? pct : 0, 100)}%`;
+    barFill.style.background = pct >= 100 ? "#e53935" : (pct >= 80 ? "#fb8c00" : "#43a047");
+    barBg.appendChild(barFill);
+    wrap.append(row, barBg);
+    el.appendChild(wrap);
+  });
 }
 
 async function loadGoals() {
   const data = await api("/api/goals");
   const el = document.getElementById("goals-list");
   if (data.items.length === 0) {
-    el.innerHTML = '<div class="empty">Целей пока нет</div>';
+    setEmpty(el, "Целей пока нет");
     return;
   }
-  el.innerHTML = data.items.map(g => `
-    <div style="margin-bottom:14px">
-      <div class="list-item" style="border:none;padding:2px 0">
-        <span>${g.name}</span>
-        <span>${g.current_formatted} / ${g.target_formatted}</span>
-      </div>
-      <div class="bar-bg"><div class="bar-fill" style="width:${Math.min(g.pct,100)}%;background:var(--tg-theme-button-color,#2481cc)"></div></div>
-    </div>
-  `).join("");
+  el.replaceChildren();
+  data.items.forEach(g => {
+    const wrap = document.createElement("div");
+    wrap.style.marginBottom = "14px";
+    const row = document.createElement("div");
+    row.className = "list-item";
+    row.style.border = "none";
+    row.style.padding = "2px 0";
+    const name = document.createElement("span");
+    name.textContent = g.name;
+    const nums = document.createElement("span");
+    nums.textContent = `${g.current_formatted} / ${g.target_formatted}`;
+    row.append(name, nums);
+    const barBg = document.createElement("div");
+    barBg.className = "bar-bg";
+    const barFill = document.createElement("div");
+    barFill.className = "bar-fill";
+    const pct = Number(g.pct);
+    barFill.style.width = `${Math.min(Number.isFinite(pct) ? pct : 0, 100)}%`;
+    barFill.style.background = "var(--tg-theme-button-color,#2481cc)";
+    barBg.appendChild(barFill);
+    wrap.append(row, barBg);
+    el.appendChild(wrap);
+  });
 }
 
 async function refresh() {
+  const err = document.getElementById("app-error");
+  err.style.display = "none";
   try {
     if (currentTab === "overview") await loadOverview();
     if (currentTab === "budgets") await loadBudgets();
     if (currentTab === "goals") await loadGoals();
   } catch (e) {
     console.error(e);
+    err.style.display = "block";
+    err.textContent = "Не удалось загрузить данные. Открой Mini App из бота после /start.";
   }
 }
 
@@ -238,11 +312,22 @@ document.getElementById("period-tabs").addEventListener("click", (e) => {
   document.getElementById("period-tabs").querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
   btn.classList.add("active");
   currentPeriod = btn.dataset.period;
+  txOffset = 0;
   refresh();
 });
 
 document.getElementById("category-filter").addEventListener("change", (e) => {
   currentCategory = e.target.value;
+  txOffset = 0;
+  refresh();
+});
+
+document.getElementById("tx-prev").addEventListener("click", () => {
+  txOffset = Math.max(0, txOffset - TX_PAGE);
+  refresh();
+});
+document.getElementById("tx-next").addEventListener("click", () => {
+  txOffset += TX_PAGE;
   refresh();
 });
 
