@@ -20,6 +20,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from openpyxl import Workbook
 
 import bank_import
+import bot
 import db
 import export
 import webapp_api
@@ -523,6 +524,71 @@ class AtomicReceiptTests(unittest.TestCase):
         db.ensure_user(9, "newbie")
         db.set_user_language(9, "en")
         self.assertEqual(db.get_user_language(9), "en")
+
+
+class HtmlEscapingTests(unittest.IsolatedAsyncioTestCase):
+    """Магазины, категории, цели и повторы - это текст пользователя (или
+    Gemini), а бот отправляет сообщения с parse_mode=HTML. Без hx() строка
+    вроде <b>x</b> или <script> ломает разметку сообщения или всплывает как
+    чужой HTML. Раньше это было защищено только в превью чека и списке
+    операций - здесь регресс на остальные экраны."""
+
+    PAYLOAD = "<script>hack</script>"
+    ESCAPED = "&lt;script&gt;hack&lt;/script&gt;"
+
+    async def asyncSetUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.old_db_path = db.DB_PATH
+        db.DB_PATH = str(Path(self.tempdir.name) / "html.db")
+        db.init_db()
+        db.ensure_user(1, "owner")
+
+    async def asyncTearDown(self):
+        db.DB_PATH = self.old_db_path
+        self.tempdir.cleanup()
+
+    def _assert_escaped(self, text: str):
+        self.assertNotIn(self.PAYLOAD, text)
+        self.assertIn(self.ESCAPED, text)
+
+    async def test_budget_warning_escapes_category_name(self):
+        cat_id = db.add_category(1, self.PAYLOAD)
+        db.set_budget(1, cat_id, 100)
+        db.add_transaction(1, "expense", 150, cat_id, None, None, "over", date.today().isoformat())
+
+        warning = await bot._budget_warning_text(1, cat_id)
+        self.assertIsNotNone(warning)
+        self._assert_escaped(warning)
+
+    def test_budget_view_escapes_category_name(self):
+        cat_id = db.add_category(1, self.PAYLOAD)
+        db.set_budget(1, cat_id, 1000)
+        text, _ = bot._budget_view(1)
+        self._assert_escaped(text)
+
+    def test_tx_detail_view_escapes_all_free_text_fields(self):
+        cat_id = db.add_category(1, self.PAYLOAD)
+        pm_id = db.add_payment_method(1, self.PAYLOAD)
+        tx_id = db.add_transaction(
+            1, "expense", 500, cat_id, pm_id, self.PAYLOAD, self.PAYLOAD,
+            date.today().isoformat(),
+        )
+        text, _ = bot._tx_detail_view(1, tx_id)
+        # Магазин, описание, категория и способ оплаты - четыре разных поля,
+        # каждое должно быть экранировано независимо от других.
+        self.assertEqual(text.count(self.ESCAPED), 4)
+        self.assertNotIn(self.PAYLOAD, text)
+
+    def test_goals_view_escapes_goal_name(self):
+        db.create_goal(1, self.PAYLOAD, 1000)
+        text, _ = bot._goals_view(1)
+        self._assert_escaped(text)
+
+    def test_recurring_view_escapes_description(self):
+        cat_id = db.get_category_id_by_name(1, "Прочее")
+        db.add_recurring(1, "expense", 100, cat_id, None, self.PAYLOAD, 5)
+        text, _ = bot._recurring_view(1)
+        self._assert_escaped(text)
 
 
 class TransactionsApiTests(unittest.IsolatedAsyncioTestCase):

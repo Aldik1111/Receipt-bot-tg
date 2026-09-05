@@ -398,7 +398,7 @@ async def add_enter_description(message: Message, state: FSMContext):
     db.touch_activity(message.from_user.id, date.today().isoformat())
     await state.clear()
     emoji = "💰" if data["tx_type"] == "income" else "💸"
-    text = f"{emoji} Записано: {money(data['amount'])} — {description or 'без описания'}"
+    text = f"{emoji} Записано: {money(data['amount'])} — {hx(description) or 'без описания'}"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="✏️ Изменить", callback_data=f"tx_open:{tx_id}")]]
     )
@@ -447,7 +447,7 @@ async def _budget_warning_text(user_id: int, category_id: int | None) -> str | N
     spent = db.get_category_spent(user_id, category_id, start.isoformat(), today.isoformat())
     limit = budget["monthly_limit"]
     pct = (spent / limit * 100) if limit > 0 else 0
-    name = db.get_category_name(user_id, category_id) or "?"
+    name = hx(db.get_category_name(user_id, category_id)) or "?"
     if pct >= 100:
         return f"⚠️ Бюджет по «{name}» превышен: {money(spent)} из {money(limit)} ({pct:.0f}%)"
     if pct >= 80:
@@ -539,7 +539,7 @@ async def _send_stats(message: Message, user_id: int, date_from: str, date_to: s
         top_stores = sorted(store_totals.items(), key=lambda kv: kv[1], reverse=True)[:5]
         lines = ["📍 <b>Топ мест трат</b>"]
         for name, amount in top_stores:
-            lines.append(f"• {name} — {money(amount)}")
+            lines.append(f"• {hx(name)} — {money(amount)}")
         await message.answer("\n".join(lines))
 
     # Способы оплаты
@@ -549,7 +549,7 @@ async def _send_stats(message: Message, user_id: int, date_from: str, date_to: s
     if len(pay_totals) > 1 or "Без указания" not in pay_totals:
         lines = ["💳 <b>По способам оплаты</b>"]
         for name, amount in sorted(pay_totals.items(), key=lambda kv: kv[1], reverse=True):
-            lines.append(f"• {name} — {money(amount)}")
+            lines.append(f"• {hx(name)} — {money(amount)}")
         await message.answer("\n".join(lines))
 
     # Когда - тренд трат по времени (не строим, если период короче 2 дней - смысла мало)
@@ -678,7 +678,7 @@ async def add_category_name(message: Message, state: FSMContext):
     db.add_category(message.from_user.id, name)
     await state.clear()
     text, keyboard = _categories_view(message.from_user.id)
-    await message.answer(f"✅ Категория «{name}» добавлена.\n\n{text}", reply_markup=keyboard)
+    await message.answer(f"✅ Категория «{hx(name)}» добавлена.\n\n{text}", reply_markup=keyboard)
 
 
 @router.callback_query(F.data.startswith("cat_edit:"))
@@ -731,10 +731,10 @@ async def edit_category_name(message: Message, state: FSMContext):
 
     text, keyboard = _categories_view(message.from_user.id)
     if ok:
-        await message.answer(f"✅ Переименовано в «{new_name}».\n\n{text}", reply_markup=keyboard)
+        await message.answer(f"✅ Переименовано в «{hx(new_name)}».\n\n{text}", reply_markup=keyboard)
     else:
         await message.answer(
-            f"⚠️ Категория «{new_name}» уже есть - выбери другое название.\n\n{text}",
+            f"⚠️ Категория «{hx(new_name)}» уже есть - выбери другое название.\n\n{text}",
             reply_markup=keyboard,
         )
 
@@ -824,7 +824,7 @@ async def add_payment_name(message: Message, state: FSMContext):
     db.add_payment_method(message.from_user.id, name)
     await state.clear()
     text, keyboard = _payments_view(message.from_user.id)
-    await message.answer(f"✅ Способ оплаты «{name}» добавлен.\n\n{text}", reply_markup=keyboard)
+    await message.answer(f"✅ Способ оплаты «{hx(name)}» добавлен.\n\n{text}", reply_markup=keyboard)
 
 
 @router.callback_query(F.data.startswith("pay_edit:"))
@@ -849,10 +849,10 @@ async def edit_payment_name(message: Message, state: FSMContext):
 
     text, keyboard = _payments_view(message.from_user.id)
     if ok:
-        await message.answer(f"✅ Переименовано в «{new_name}».\n\n{text}", reply_markup=keyboard)
+        await message.answer(f"✅ Переименовано в «{hx(new_name)}».\n\n{text}", reply_markup=keyboard)
     else:
         await message.answer(
-            f"⚠️ Способ оплаты «{new_name}» уже есть - выбери другое название.\n\n{text}",
+            f"⚠️ Способ оплаты «{hx(new_name)}» уже есть - выбери другое название.\n\n{text}",
             reply_markup=keyboard,
         )
 
@@ -1079,14 +1079,14 @@ def _tx_detail_view(user_id: int, tx_id: int) -> tuple[str, InlineKeyboardMarkup
         return None
 
     emoji = TYPE_EMOJI.get(r["type"], "•")
-    cat_display = f"{r['category_emoji']} {r['category_name']}" if r["category_name"] else "—"
+    cat_display = f"{r['category_emoji']} {hx(r['category_name'])}" if r["category_name"] else "—"
     lines = [
         f"{emoji} <b>{money(r['amount'])}</b>",
         f"Дата: {r['op_date']}" + (f"  Время: {r['op_time']}" if r["op_time"] else ""),
         f"Категория: {cat_display}",
-        f"Способ оплаты: {r['payment_name'] or '—'}",
-        f"Магазин: {r['store'] or '—'}",
-        f"Описание: {r['description'] or '—'}",
+        f"Способ оплаты: {hx(r['payment_name']) or '—'}",
+        f"Магазин: {hx(r['store']) or '—'}",
+        f"Описание: {hx(r['description']) or '—'}",
     ]
     text = "\n".join(lines)
 
@@ -1280,7 +1280,7 @@ def _budget_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         spent = db.get_category_spent(user_id, b["category_id"], start.isoformat(), today.isoformat())
         pct = (spent / b["monthly_limit"] * 100) if b["monthly_limit"] > 0 else 0
         emoji = "🔴" if pct >= 100 else ("🟡" if pct >= 80 else "🟢")
-        lines.append(f"{emoji} {b['category_name']}: {money(spent)} / {money(b['monthly_limit'])} ({pct:.0f}%)")
+        lines.append(f"{emoji} {hx(b['category_name'])}: {money(spent)} / {money(b['monthly_limit'])} ({pct:.0f}%)")
         buttons.append([
             InlineKeyboardButton(text=f"✏️ {b['category_name']}", callback_data=f"bud_pick:{b['category_id']}"),
             InlineKeyboardButton(text="🗑", callback_data=f"bud_del:{b['id']}"),
@@ -1361,7 +1361,7 @@ def _goals_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     for g in goals:
         pct = (g["current_amount"] / g["target_amount"] * 100) if g["target_amount"] > 0 else 0
         lines.append(
-            f"<b>{g['name']}</b>: {money(g['current_amount'])} / {money(g['target_amount'])}\n"
+            f"<b>{hx(g['name'])}</b>: {money(g['current_amount'])} / {money(g['target_amount'])}\n"
             f"{_progress_bar(pct)} {pct:.0f}%"
         )
         buttons.append([
@@ -1482,7 +1482,7 @@ def _recurring_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     for r in items:
         status = "✅" if r["active"] else "⏸"
         emoji = "💸" if r["type"] == "expense" else "💰"
-        label = r["description"] or r["category_name"] or "без названия"
+        label = hx(r["description"] or r["category_name"]) or "без названия"
         lines.append(f"{status} {emoji} {money(r['amount'])} — {label}, {r['day_of_month']} числа каждый месяц")
         buttons.append([
             InlineKeyboardButton(text="⏸/▶️ Вкл/выкл", callback_data=f"rec_toggle:{r['id']}"),
@@ -1619,7 +1619,7 @@ async def _recurring_scheduler(bot: Bot):
                     emoji = "💰" if r["type"] == "income" else "💸"
                     await bot.send_message(
                         r["user_id"],
-                        f"🔁 Автоматически добавлено: {emoji} {money(r['amount'])} — {r['description'] or ''}",
+                        f"🔁 Автоматически добавлено: {emoji} {money(r['amount'])} — {hx(r['description']) or ''}",
                     )
                 except Exception:
                     logger.exception(
@@ -1670,7 +1670,7 @@ async def catstat_show(callback: CallbackQuery):
     prev_from, prev_to = _previous_period_bounds(date_from, date_to)
     prev_spent = db.get_category_spent(user_id, cat_id, prev_from, prev_to)
 
-    cat_name = db.get_category_name(user_id, cat_id) or "?"
+    cat_name = hx(db.get_category_name(user_id, cat_id)) or "?"
     text = (
         f"🔍 <b>{cat_name}</b> — {label}\n"
         f"Период: {date_from} — {date_to}\n\n"
@@ -1848,7 +1848,7 @@ async def _digest_scheduler(bot: Bot):
                         lang,
                     )
                     if insight:
-                        text += f"\n\n💡 {insight}"
+                        text += f"\n\n💡 {hx(insight)}"
 
                     await bot.send_message(user_id, text)
                     db.mark_digest_sent(user_id, today.isoformat())
