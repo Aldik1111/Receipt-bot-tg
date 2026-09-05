@@ -1364,22 +1364,41 @@ def get_all_user_rows(user_id: int) -> dict:
             (user_id,),
         ).fetchone()
 
+        # backup_id + runs: без этого восстановление создавало бы повторы с
+        # новыми id и пустой историей recurring_runs, а планировщик списывал
+        # бы уже сработавший в этом месяце платёж повторно (см. apply_due_recurring).
+        recurring = rows_as_dicts(
+            """SELECT r.id, r.type, r.amount, c.name AS category, p.name AS payment_method,
+                      r.description, r.day_of_month, r.last_run_date, r.active
+               FROM recurring_payments r
+               LEFT JOIN categories c ON c.id = r.category_id
+               LEFT JOIN payment_methods p ON p.id = r.payment_method_id
+               WHERE r.user_id=?
+               ORDER BY r.id"""
+        )
+        recurring_id_map = {row["id"]: index + 1 for index, row in enumerate(recurring)}
+        runs_by_recurring_id: dict[int, list[str]] = {}
+        for run_row in conn.execute(
+            """SELECT rr.recurring_id, rr.period FROM recurring_runs rr
+               JOIN recurring_payments r ON r.id = rr.recurring_id
+               WHERE r.user_id=?
+               ORDER BY rr.recurring_id, rr.period""",
+            (user_id,),
+        ):
+            runs_by_recurring_id.setdefault(run_row["recurring_id"], []).append(run_row["period"])
+        for row in recurring:
+            original_id = row.pop("id")
+            row["backup_id"] = recurring_id_map[original_id]
+            row["runs"] = runs_by_recurring_id.get(original_id, [])
+
         return {
-            "version": 2,
+            "version": 3,
             "settings": dict(settings) if settings else {},
             "categories": rows_as_dicts("SELECT name, emoji FROM categories WHERE user_id=? ORDER BY id"),
             "payment_methods": rows_as_dicts("SELECT name FROM payment_methods WHERE user_id=? ORDER BY id"),
             "receipts": receipts,
             "transactions": transactions,
-            "recurring": rows_as_dicts(
-                """SELECT r.type, r.amount, c.name AS category, p.name AS payment_method,
-                          r.description, r.day_of_month, r.last_run_date, r.active
-                   FROM recurring_payments r
-                   LEFT JOIN categories c ON c.id = r.category_id
-                   LEFT JOIN payment_methods p ON p.id = r.payment_method_id
-                   WHERE r.user_id=?
-                   ORDER BY r.id"""
-            ),
+            "recurring": recurring,
             "budgets": rows_as_dicts(
                 """SELECT c.name AS category, b.monthly_limit FROM category_budgets b
                    JOIN categories c ON c.id = b.category_id WHERE b.user_id=?"""
@@ -1499,7 +1518,7 @@ def restore_user_backup(user_id: int, data: dict) -> dict[str, int]:
 
         rec_count = 0
         for rec in data.get("recurring") or []:
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO recurring_payments
                    (user_id, type, amount, category_id, payment_method_id, description,
                     day_of_month, last_run_date, active, created_at)
@@ -1517,6 +1536,15 @@ def restore_user_backup(user_id: int, data: dict) -> dict[str, int]:
                     now,
                 ),
             )
+            new_recurring_id = cur.lastrowid
+            # Периоды, когда платёж уже сработал (backup v3+). Без этого
+            # apply_due_recurring не видит истории для нового id и в этом же
+            # месяце списывает платёж повторно, дублируя транзакцию.
+            for period in rec.get("runs") or []:
+                conn.execute(
+                    "INSERT INTO recurring_runs(recurring_id, period) VALUES (?,?)",
+                    (new_recurring_id, period),
+                )
             rec_count += 1
 
         for budget in data.get("budgets") or []:

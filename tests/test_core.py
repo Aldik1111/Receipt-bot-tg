@@ -503,7 +503,7 @@ class AtomicReceiptTests(unittest.TestCase):
         self.assertEqual(self._counts(), (0, 0))
         self.assertEqual(len(db.load_state("import_draft", "1_10")), 2)
 
-    def test_backup_v2_round_trip_is_idempotent(self):
+    def test_backup_v3_round_trip_is_idempotent(self):
         cat_id = db.get_category_id_by_name(1, "Продукты")
         db.add_transaction(1, "income", 50, cat_id, None, "Shop", "salary", "2026-08-20", "10:00")
         db.add_recurring(1, "expense", 9, cat_id, None, "net", 5)
@@ -511,7 +511,7 @@ class AtomicReceiptTests(unittest.TestCase):
         db.create_goal(1, "Отпуск", 1000)
         db.learn_category(1, "кофе", cat_id)
         data = db.get_all_user_rows(1)
-        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["version"], 3)
         db.restore_user_backup(1, data)
         db.restore_user_backup(1, data)
         with db.get_conn() as conn:
@@ -519,6 +519,62 @@ class AtomicReceiptTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM recurring_payments WHERE user_id=1").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM savings_goals WHERE user_id=1").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT type FROM transactions WHERE user_id=1").fetchone()[0], "income")
+
+    def test_backup_v3_preserves_recurring_runs_and_prevents_double_apply(self):
+        """До этого теста recurring_runs не попадал в бэкап: restore создавал
+        повтор с новым id и пустой историей, а планировщик списывал тот же
+        платёж повторно в том же месяце."""
+        cat_id = db.get_category_id_by_name(1, "Продукты")
+        rec_id = db.add_recurring(1, "expense", 500, cat_id, None, "rent", 1)
+        today = date.today().replace(day=28).isoformat()
+        self.assertTrue(db.apply_due_recurring(rec_id, today))
+
+        data = db.get_all_user_rows(1)
+        period = today[:7]
+        self.assertEqual(data["recurring"][0]["runs"], [period])
+
+        db.restore_user_backup(1, data)
+
+        with db.get_conn() as conn:
+            new_id = conn.execute(
+                "SELECT id FROM recurring_payments WHERE user_id=1 AND description='rent'"
+            ).fetchone()[0]
+        # Тот же месяц, платёж уже шёл до бэкапа - повторный прогон
+        # планировщика не должен списать деньги второй раз.
+        self.assertFalse(db.apply_due_recurring(new_id, today))
+        with db.get_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM transactions WHERE user_id=1 AND description='rent'"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_restore_rejects_non_dict_payload_and_keeps_existing_data(self):
+        cat_id = db.get_category_id_by_name(1, "Продукты")
+        db.add_transaction(1, "expense", 10, cat_id, None, None, "keep me", "2026-08-20")
+        with self.assertRaises(ValueError):
+            db.restore_user_backup(1, ["not", "a", "dict"])
+        with db.get_conn() as conn:
+            desc = conn.execute("SELECT description FROM transactions WHERE user_id=1").fetchone()[0]
+        self.assertEqual(desc, "keep me")
+
+    def test_restore_failure_rolls_back_wipe(self):
+        """Если восстановление падает на середине (битые данные внутри
+        валидного dict), старые данные пользователя не должны стираться."""
+        cat_id = db.get_category_id_by_name(1, "Продукты")
+        db.add_transaction(1, "expense", 10, cat_id, None, None, "keep me", "2026-08-20")
+        broken = {
+            "settings": {}, "categories": [], "payment_methods": [],
+            "receipts": [], "recurring": [], "budgets": [], "goals": [], "learned": [],
+            # transactions без обязательного op_date - KeyError внутри транзакции
+            "transactions": [{"type": "expense", "amount": 5, "description": "x"}],
+        }
+        with self.assertRaises(Exception):
+            db.restore_user_backup(1, broken)
+        with db.get_conn() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM transactions WHERE user_id=1").fetchone()[0]
+            desc = conn.execute("SELECT description FROM transactions WHERE user_id=1").fetchone()[0]
+        self.assertEqual(count, 1)
+        self.assertEqual(desc, "keep me")
 
     def test_language_update_creates_user(self):
         db.ensure_user(9, "newbie")

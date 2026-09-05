@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import logging
 import os
 import re
@@ -43,6 +44,8 @@ router = Router()
 BACKGROUND_TASKS: list[asyncio.Task] = []
 TEXT_HINT = "Пришли текстом. /cancel — сбросить сценарий."
 MAX_IMPORT_BYTES = 2 * 1024 * 1024
+# 20 МБ - предел, который Telegram Bot API вообще позволяет боту скачать у себя.
+MAX_RESTORE_BYTES = 20 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Черновики распознанных чеков, ожидающих подтверждения, и незавершённый
@@ -53,6 +56,7 @@ MAX_IMPORT_BYTES = 2 * 1024 * 1024
 RECEIPT_SCOPE = "receipt_draft"
 IMPORT_SCOPE = "import_draft"
 LIST_SCOPE = "list_context"
+RESTORE_SCOPE = "restore_draft"
 
 
 class ManualEntry(StatesGroup):
@@ -72,6 +76,10 @@ class CategoryEntry(StatesGroup):
 class PaymentEntry(StatesGroup):
     entering_name = State()
     editing_name = State()
+
+
+class RestoreEntry(StatesGroup):
+    awaiting_file = State()
 
 
 # ---------------------------------------------------------------------------
@@ -1896,6 +1904,7 @@ def _settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             callback_data="settings_toggle_bank",
         )],
         [InlineKeyboardButton(text="📦 Скачать бэкап сейчас", callback_data="settings_backup_now")],
+        [InlineKeyboardButton(text="📥 Восстановить из файла", callback_data="settings_restore_start")],
         [InlineKeyboardButton(text="⚠️ Удалить все мои данные", callback_data="danger_start")],
     ])
     return text, keyboard
@@ -1989,6 +1998,111 @@ async def settings_backup_now(callback: CallbackQuery):
         return
     db.mark_backup_sent(callback.from_user.id, date.today().isoformat())
     await callback.answer("Бэкап отправлен")
+
+
+# ---------------------------------------------------------------------------
+# Восстановление из JSON-бэкапа прямо в чате: без этого пользователь без
+# доступа к серверу не мог восстановиться после потери телефона/переустановки.
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "settings_restore_start")
+async def settings_restore_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(RestoreEntry.awaiting_file)
+    await callback.message.answer(
+        "📥 Пришли файл бэкапа (.json), который я присылал раньше.\n\n"
+        "⚠️ Все текущие операции, чеки, повторы, бюджеты и цели будут "
+        "<b>полностью заменены</b> содержимым файла. Отменить это будет нельзя.\n\n"
+        "/cancel — отмена."
+    )
+    await callback.answer()
+
+
+@router.message(RestoreEntry.awaiting_file, F.document)
+async def restore_receive_file(message: Message, state: FSMContext, bot: Bot):
+    doc = message.document
+    if doc.file_size and doc.file_size > MAX_RESTORE_BYTES:
+        await message.answer("Файл слишком большой (максимум 20 МБ).")
+        return
+    file = await bot.get_file(doc.file_id)
+    buf = io.BytesIO()
+    await bot.download_file(file.file_path, destination=buf)
+    raw = buf.getvalue()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        await message.answer("❌ Это не похоже на JSON-бэкап. Пришли файл без изменений или /cancel.")
+        return
+    if not isinstance(data, dict):
+        await message.answer("❌ Некорректный формат бэкапа. Пришли файл без изменений или /cancel.")
+        return
+
+    draft_id = f"{message.from_user.id}_{uuid.uuid4().hex[:10]}"
+    db.save_state(RESTORE_SCOPE, draft_id, data, user_id=message.from_user.id)
+    await state.clear()
+
+    counts = (
+        f"🧾 Чеков: {len(data.get('receipts') or [])}\n"
+        f"💰 Операций: {len(data.get('transactions') or [])}\n"
+        f"🔁 Повторов: {len(data.get('recurring') or [])}\n"
+        f"🎯 Целей: {len(data.get('goals') or [])}\n"
+        f"🏷 Категорий: {len(data.get('categories') or [])}"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Заменить данные", callback_data=f"restore_go:{draft_id}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"restore_no:{draft_id}"),
+    ]])
+    await message.answer(
+        f"Нашёл в файле:\n{counts}\n\n⚠️ Все текущие данные будут заменены этим. Подтверждаешь?",
+        reply_markup=keyboard,
+    )
+
+
+@router.message(RestoreEntry.awaiting_file)
+async def restore_awaiting_wrong_content(message: Message):
+    await message.answer("Жду файл бэкапа (.json). /cancel — отмена.")
+
+
+@router.callback_query(F.data.startswith("restore_go:"))
+async def restore_confirm(callback: CallbackQuery):
+    draft_id = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    if not draft_id.startswith(f"{user_id}_"):
+        await callback.answer("Это не твой черновик.", show_alert=True)
+        return
+    data = db.load_state(RESTORE_SCOPE, draft_id)
+    if data is None:
+        await callback.answer("Черновик устарел, пришли файл ещё раз.", show_alert=True)
+        return
+    try:
+        result = await asyncio.to_thread(db.restore_user_backup, user_id, data)
+    except Exception:
+        logger.exception("Не удалось восстановить бэкап")
+        await callback.message.edit_text(
+            "❌ Не получилось восстановить бэкап - файл повреждён или несовместим. "
+            "Твои текущие данные не тронуты."
+        )
+        await callback.answer()
+        return
+    db.delete_state(RESTORE_SCOPE, draft_id)
+    await callback.message.edit_text(
+        "✅ Данные восстановлены:\n"
+        f"💰 Операций: {result.get('transactions', 0)}\n"
+        f"🧾 Чеков: {result.get('receipts', 0)}\n"
+        f"🔁 Повторов: {result.get('recurring', 0)}\n"
+        f"🎯 Целей: {result.get('goals', 0)}"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("restore_no:"))
+async def restore_cancel(callback: CallbackQuery):
+    draft_id = callback.data.split(":", 1)[1]
+    if not draft_id.startswith(f"{callback.from_user.id}_"):
+        await callback.answer("Это не твой черновик.", show_alert=True)
+        return
+    db.delete_state(RESTORE_SCOPE, draft_id)
+    await callback.message.edit_text("Восстановление отменено, данные не тронуты.")
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
