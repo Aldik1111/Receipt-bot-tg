@@ -417,6 +417,55 @@ class AtomicReceiptTests(unittest.TestCase):
         self.assertEqual(stored, fallback)
         self.assertFalse(db.update_transaction_category(1, 1, other_cat))
 
+    def test_transaction_date_type_and_store_updates_are_owner_scoped(self):
+        cat_id = db.get_category_id_by_name(1, "Продукты")
+        tx_id = db.add_transaction(
+            1, "expense", 500, cat_id, None, "Старый", "покупка", "2026-08-20"
+        )
+
+        self.assertTrue(db.update_transaction_date(1, tx_id, "2026-09-04"))
+        self.assertTrue(db.update_transaction_type(1, tx_id, "income"))
+        self.assertTrue(db.update_transaction_store(1, tx_id, "Новый магазин"))
+        row = db.get_transaction_by_id(1, tx_id)
+        self.assertEqual(row["op_date"], "2026-09-04")
+        self.assertEqual(row["type"], "income")
+        self.assertEqual(row["store"], "Новый магазин")
+        # После смены на доход операция больше не расходует бюджет категории.
+        self.assertEqual(db.get_category_spent(1, cat_id, "2026-09-01", "2026-09-30"), 0)
+
+        for update, value in (
+            (db.update_transaction_date, "2026-09-05"),
+            (db.update_transaction_type, "expense"),
+            (db.update_transaction_store, "Чужой магазин"),
+        ):
+            self.assertFalse(update(2, tx_id, value))
+            self.assertFalse(update(1, 999_999, value))
+
+        self.assertFalse(db.update_transaction_date(1, tx_id, "04.09.2026"))
+        self.assertFalse(db.update_transaction_type(1, tx_id, "transfer"))
+        row = db.get_transaction_by_id(1, tx_id)
+        self.assertEqual(row["op_date"], "2026-09-04")
+        self.assertEqual(row["type"], "income")
+        self.assertEqual(row["store"], "Новый магазин")
+
+    def test_transaction_detail_has_new_edit_controls_and_local_date(self):
+        cat_id = db.get_category_id_by_name(1, "Продукты")
+        tx_id = db.add_transaction(
+            1, "expense", 500, cat_id, None, "Магазин", "покупка", "2026-09-04"
+        )
+        text, keyboard = bot._tx_detail_view(1, tx_id)
+        self.assertIn("Тип: Расход", text)
+        self.assertIn("Дата: 04.09.2026", text)
+        callbacks = {
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertIn(f"tx_date:{tx_id}", callbacks)
+        self.assertIn(f"tx_type:{tx_id}", callbacks)
+        self.assertIn(f"tx_store:{tx_id}", callbacks)
+
     def test_protected_category_cannot_be_renamed(self):
         other_id = db.get_category_id_by_name(1, "Прочее")
         self.assertFalse(db.rename_category(1, other_id, "Разное"))

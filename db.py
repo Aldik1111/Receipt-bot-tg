@@ -711,6 +711,40 @@ def update_transaction_amount(user_id: int, tx_id: int, amount: float) -> bool:
         return cur.rowcount > 0
 
 
+def update_transaction_date(user_id: int, tx_id: int, op_date: str) -> bool:
+    """Обновляет дату только своей операции; принимает ISO YYYY-MM-DD."""
+    try:
+        datetime.strptime(op_date, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return False
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE transactions SET op_date=? WHERE id=? AND user_id=?",
+            (op_date, tx_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def update_transaction_type(user_id: int, tx_id: int, tx_type: str) -> bool:
+    if tx_type not in ("expense", "income"):
+        return False
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE transactions SET type=? WHERE id=? AND user_id=?",
+            (tx_type, tx_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def update_transaction_store(user_id: int, tx_id: int, store: str | None) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE transactions SET store=? WHERE id=? AND user_id=?",
+            (store, tx_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
 def update_transaction_description(user_id: int, tx_id: int, description: str | None) -> bool:
     with get_conn() as conn:
         cur = conn.execute(

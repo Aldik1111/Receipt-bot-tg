@@ -1087,10 +1087,16 @@ def _tx_detail_view(user_id: int, tx_id: int) -> tuple[str, InlineKeyboardMarkup
         return None
 
     emoji = TYPE_EMOJI.get(r["type"], "•")
+    type_label = "Доход" if r["type"] == "income" else "Расход"
+    try:
+        display_date = datetime.strptime(r["op_date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+    except (TypeError, ValueError):
+        display_date = hx(r["op_date"]) or "—"
     cat_display = f"{r['category_emoji']} {hx(r['category_name'])}" if r["category_name"] else "—"
     lines = [
         f"{emoji} <b>{money(r['amount'])}</b>",
-        f"Дата: {r['op_date']}" + (f"  Время: {r['op_time']}" if r["op_time"] else ""),
+        f"Тип: {type_label}",
+        f"Дата: {display_date}" + (f"  Время: {r['op_time']}" if r["op_time"] else ""),
         f"Категория: {cat_display}",
         f"Способ оплаты: {hx(r['payment_name']) or '—'}",
         f"Магазин: {hx(r['store']) or '—'}",
@@ -1108,6 +1114,11 @@ def _tx_detail_view(user_id: int, tx_id: int) -> tuple[str, InlineKeyboardMarkup
                 InlineKeyboardButton(text="💳 Оплата", callback_data=f"tx_pay:{tx_id}"),
                 InlineKeyboardButton(text="📝 Описание", callback_data=f"tx_desc:{tx_id}"),
             ],
+            [
+                InlineKeyboardButton(text="📅 Дата", callback_data=f"tx_date:{tx_id}"),
+                InlineKeyboardButton(text="🏪 Магазин", callback_data=f"tx_store:{tx_id}"),
+            ],
+            [InlineKeyboardButton(text="🔄 Тип операции", callback_data=f"tx_type:{tx_id}")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"tx_del:{tx_id}")],
             [InlineKeyboardButton(text="◀️ К списку", callback_data="recent_back")],
         ]
@@ -1130,6 +1141,8 @@ async def tx_open(callback: CallbackQuery):
 class TransactionEdit(StatesGroup):
     entering_amount = State()
     entering_description = State()
+    entering_date = State()
+    entering_store = State()
 
 
 @router.callback_query(F.data.startswith("tx_amount:"))
@@ -1158,6 +1171,99 @@ async def tx_edit_amount_apply(message: Message, state: FSMContext):
         return
     text, keyboard = view
     await message.answer(f"✅ Сумма обновлена.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("tx_date:"))
+async def tx_edit_date_start(callback: CallbackQuery, state: FSMContext):
+    tx_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(edit_tx_id=tx_id)
+    await state.set_state(TransactionEdit.entering_date)
+    await callback.message.edit_text(
+        "Введи новую дату в формате <code>ДД.ММ.ГГГГ</code>, например "
+        "<code>04.09.2026</code>:"
+    )
+    await callback.answer()
+
+
+@router.message(TransactionEdit.entering_date)
+async def tx_edit_date_apply(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
+    try:
+        new_date = datetime.strptime(message.text.strip(), "%d.%m.%Y").date().isoformat()
+    except ValueError:
+        await message.answer("Не разобрал дату. Используй формат ДД.ММ.ГГГГ, например 04.09.2026.")
+        return
+    data = await state.get_data()
+    tx_id = data["edit_tx_id"]
+    if not db.update_transaction_date(message.from_user.id, tx_id, new_date):
+        await state.clear()
+        await message.answer("Операция не найдена (возможно, уже удалена)")
+        return
+    await state.clear()
+    text, keyboard = _tx_detail_view(message.from_user.id, tx_id)
+    await message.answer(f"✅ Дата обновлена.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("tx_store:"))
+async def tx_edit_store_start(callback: CallbackQuery, state: FSMContext):
+    tx_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(edit_tx_id=tx_id)
+    await state.set_state(TransactionEdit.entering_store)
+    await callback.message.edit_text("Введи новый магазин (или '-' чтобы убрать):")
+    await callback.answer()
+
+
+@router.message(TransactionEdit.entering_store)
+async def tx_edit_store_apply(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(TEXT_HINT)
+        return
+    value = message.text.strip()
+    if len(value) > 128:
+        await message.answer("Название магазина слишком длинное. Максимум 128 символов.")
+        return
+    new_store = None if value == "-" else value
+    data = await state.get_data()
+    tx_id = data["edit_tx_id"]
+    if not db.update_transaction_store(message.from_user.id, tx_id, new_store):
+        await state.clear()
+        await message.answer("Операция не найдена (возможно, уже удалена)")
+        return
+    await state.clear()
+    text, keyboard = _tx_detail_view(message.from_user.id, tx_id)
+    await message.answer(f"✅ Магазин обновлён.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("tx_type:"))
+async def tx_edit_type_start(callback: CallbackQuery):
+    tx_id = int(callback.data.split(":", 1)[1])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💸 Расход", callback_data=f"tx_settype:{tx_id}:expense"),
+            InlineKeyboardButton(text="💰 Доход", callback_data=f"tx_settype:{tx_id}:income"),
+        ],
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"tx_open:{tx_id}")],
+    ])
+    await callback.message.edit_text("Выбери новый тип операции:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tx_settype:"))
+async def tx_edit_type_apply(callback: CallbackQuery):
+    _, tx_id_raw, tx_type = callback.data.split(":")
+    tx_id = int(tx_id_raw)
+    if not db.update_transaction_type(callback.from_user.id, tx_id, tx_type):
+        await callback.answer("Операция не найдена или тип некорректен", show_alert=True)
+        return
+    view = _tx_detail_view(callback.from_user.id, tx_id)
+    if not view:
+        await callback.answer("Операция не найдена (возможно, уже удалена)", show_alert=True)
+        return
+    text, keyboard = view
+    await callback.message.edit_text(f"✅ Тип операции обновлён.\n\n{text}", reply_markup=keyboard)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("tx_desc:"))
