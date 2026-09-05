@@ -1212,6 +1212,19 @@ def commit_import_draft(
                 ).fetchone()
                 category_id = cat["id"] if cat else None
             category_id = _owned_category_id(conn, user_id, category_id)
+
+            # Способ оплаты из файла берём только если такой уже есть у
+            # пользователя: импорт не должен молча плодить новые карты.
+            row_payment_id = payment_method_id
+            pm_name = item.get("payment")
+            if pm_name:
+                pm = conn.execute(
+                    "SELECT id FROM payment_methods WHERE user_id=? AND name=?",
+                    (user_id, pm_name),
+                ).fetchone()
+                if pm:
+                    row_payment_id = pm["id"]
+
             conn.execute(
                 """INSERT INTO transactions(user_id, type, amount, category_id,
                    payment_method_id, store, description, receipt_id, op_date,
@@ -1221,8 +1234,8 @@ def commit_import_draft(
                     tx_type,
                     round(float(item["amount"]), 2),
                     category_id,
-                    payment_method_id,
-                    None,
+                    row_payment_id,
+                    (item.get("store") or None),
                     item.get("description"),
                     None,
                     item.get("date") or fallback_date,

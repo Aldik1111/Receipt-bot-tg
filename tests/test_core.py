@@ -78,6 +78,44 @@ class ImportExportTests(unittest.TestCase):
         self.assertEqual(parsed[0]["date"], "2026-08-20")
         self.assertEqual(parsed[0]["amount"], 1250.5)
         self.assertEqual(parsed[0]["description"], "Молоко")
+        self.assertEqual(parsed[0]["type"], "expense")
+        self.assertEqual(parsed[0]["category"], "Продукты")
+        self.assertEqual(parsed[0]["payment"], "Карта")
+        self.assertEqual(parsed[0]["store"], "Magnum")
+
+    def test_own_export_keeps_income_and_expense_apart(self):
+        """Своя выгрузка пишет только положительные суммы, направление — в
+        колонке «Тип». Раньше импорт смотрел лишь на знак и превращал в расход
+        весь файл, включая зарплату."""
+        source = [
+            {
+                "op_date": "2026-08-20", "op_time": "10:00", "type": "income",
+                "amount": 50000.0, "category_name": "Прочее",
+                "payment_name": "Карта", "store": None, "description": "Зарплата",
+            },
+            {
+                "op_date": "2026-08-21", "op_time": "12:00", "type": "expense",
+                "amount": 700.0, "category_name": "Транспорт",
+                "payment_name": "Наличные", "store": None, "description": "Такси",
+            },
+        ]
+        data = export.export_csv(source).read()
+        parsed = export.parse_import_file(data, "operations.csv")
+
+        self.assertEqual([r["type"] for r in parsed], ["income", "expense"])
+        self.assertEqual([r["amount"] for r in parsed], [50000.0, 700.0])
+        self.assertEqual([r["category"] for r in parsed], ["Прочее", "Транспорт"])
+
+    def test_own_xlsx_export_keeps_type(self):
+        source = [{
+            "op_date": "2026-08-20", "op_time": "10:00", "type": "income",
+            "amount": 1000.0, "category_name": "Прочее",
+            "payment_name": "Карта", "store": None, "description": "Возврат",
+        }]
+        data = export.export_xlsx(source).read()
+        parsed = export.parse_import_file(data, "operations.xlsx")
+        self.assertEqual(parsed[0]["type"], "income")
+        self.assertEqual(parsed[0]["amount"], 1000.0)
 
     def test_semicolon_delimited_bank_csv(self):
         data = (
@@ -90,7 +128,50 @@ class ImportExportTests(unittest.TestCase):
             "type": "expense",
             "date": "2026-08-20",
             "description": "Такси",
+            "category": None,
+            "payment": None,
+            "store": None,
         }])
+
+    def test_bank_csv_without_type_column_still_uses_sign(self):
+        """Выписка без колонки типа и без минусов - по-прежнему считаем расходом."""
+        data = (
+            "Дата;Сумма;Описание\r\n"
+            "20.08.2026;1 500,50;Такси\r\n"
+            "21.08.2026;300;Кофе\r\n"
+        ).encode("utf-8")
+        parsed = export.parse_import_file(data, "bank.csv")
+        self.assertEqual([r["type"] for r in parsed], ["expense", "expense"])
+
+    def test_explicit_type_survives_when_file_has_no_minuses(self):
+        """Смешанный файл с колонкой типа: эвристика «нет минусов - всё расход»
+        не должна перетирать явно указанный доход."""
+        data = (
+            "Дата;Тип;Сумма;Описание\r\n"
+            "20.08.2026;Доход;50000;Зарплата\r\n"
+            "21.08.2026;Расход;700;Такси\r\n"
+        ).encode("utf-8")
+        parsed = export.parse_import_file(data, "bank.csv")
+        self.assertEqual([r["type"] for r in parsed], ["income", "expense"])
+
+    def test_unknown_type_word_falls_back_to_sign(self):
+        data = (
+            "Дата;Тип;Сумма;Описание\r\n"
+            "20.08.2026;непонятно;-700;Такси\r\n"
+        ).encode("utf-8")
+        parsed = export.parse_import_file(data, "bank.csv")
+        self.assertEqual(parsed[0]["type"], "expense")
+        self.assertEqual(parsed[0]["amount"], 700.0)
+
+    def test_zero_and_non_finite_amounts_are_skipped(self):
+        data = (
+            "Дата;Сумма;Описание\r\n"
+            "20.08.2026;0;Ноль\r\n"
+            "20.08.2026;nan;Мусор\r\n"
+            "20.08.2026;-500;Такси\r\n"
+        ).encode("utf-8")
+        parsed = export.parse_import_file(data, "bank.csv")
+        self.assertEqual([r["description"] for r in parsed], ["Такси"])
 
     def test_cp1251_csv(self):
         data = "Дата;Сумма;Описание\r\n20.08.2026;-100;Такси\r\n".encode("cp1251")
@@ -362,6 +443,47 @@ class AtomicReceiptTests(unittest.TestCase):
         with db.get_conn() as conn:
             types = [r[0] for r in conn.execute("SELECT type FROM transactions ORDER BY id").fetchall()]
         self.assertEqual(types, ["expense", "income"])
+
+    def test_import_applies_type_store_and_payment_from_file(self):
+        rows = [{
+            "amount": 5000, "type": "income", "date": "2026-08-20",
+            "description": "Зарплата", "category": "Прочее",
+            "payment": "Карта (основная)", "store": "Работа",
+        }]
+        db.save_state("import_draft", "1_11", rows, user_id=1)
+        self.assertEqual(
+            db.commit_import_draft(1, "1_11", db.get_default_payment_method_id(1), "2026-08-20"),
+            1,
+        )
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT type, store, payment_method_id FROM transactions WHERE user_id=1"
+            ).fetchone()
+        self.assertEqual(row["type"], "income")
+        self.assertEqual(row["store"], "Работа")
+        self.assertEqual(
+            row["payment_method_id"], db.get_payment_method_id_by_name(1, "Карта (основная)")
+        )
+
+    def test_unknown_payment_from_file_falls_back_to_default(self):
+        rows = [{
+            "amount": 100, "type": "expense", "date": "2026-08-20",
+            "description": "Кофе", "category": "Прочее",
+            "payment": "Банк которого нет", "store": None,
+        }]
+        db.save_state("import_draft", "1_12", rows, user_id=1)
+        default_pm = db.get_default_payment_method_id(1)
+        self.assertEqual(db.commit_import_draft(1, "1_12", default_pm, "2026-08-20"), 1)
+        with db.get_conn() as conn:
+            stored = conn.execute(
+                "SELECT payment_method_id FROM transactions WHERE user_id=1"
+            ).fetchone()[0]
+        self.assertEqual(stored, default_pm)
+        with db.get_conn() as conn:
+            pm_count = conn.execute(
+                "SELECT COUNT(*) FROM payment_methods WHERE user_id=1"
+            ).fetchone()[0]
+        self.assertEqual(pm_count, 2)  # импорт не создал новую карту
 
     def test_import_failure_keeps_draft(self):
         rows = [

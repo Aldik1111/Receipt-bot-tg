@@ -2084,19 +2084,23 @@ async def handle_import_file(message: Message, bot: Bot):
 
     import_id = f"{user_id}_{message.message_id}"
     db.save_state(IMPORT_SCOPE, import_id, rows, user_id=user_id)
-    total = sum(r["amount"] for r in rows)
+    expense_total = sum(r["amount"] for r in rows if r["type"] == "expense")
+    income_total = sum(r["amount"] for r in rows if r["type"] == "income")
     preview_lines = [
-        f"• {hx(r['date']) or '—'} — {money(r['amount'])} — {hx(r['description']) or 'без описания'}"
+        f"• {hx(r['date']) or '—'} — {'+' if r['type'] == 'income' else '−'}{money(r['amount'])}"
+        f" — {hx(r['description']) or 'без описания'}"
         for r in rows[:10]
     ]
     more = f"\n… и ещё {len(rows) - 10}" if len(rows) > 10 else ""
+    header = f"📤 Нашёл {len(rows)} операций:\n💸 Расходы: {money(expense_total)}"
+    if income_total:
+        header += f"\n💰 Доходы: {money(income_total)}"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"✅ Импортировать всё ({len(rows)})", callback_data=f"imp_ok:{message.message_id}"),
         InlineKeyboardButton(text="❌ Отмена", callback_data=f"imp_no:{message.message_id}"),
     ]])
     await message.answer(
-        f"📤 Нашёл {len(rows)} операций на общую сумму {money(total)}:\n\n"
-        + "\n".join(preview_lines) + more + "\n\nИмпортировать?",
+        header + "\n\n" + "\n".join(preview_lines) + more + "\n\nИмпортировать?",
         reply_markup=keyboard,
     )
 
@@ -2111,10 +2115,19 @@ async def import_confirm(callback: CallbackQuery):
     if not rows:
         await callback.message.edit_text("Черновик устарел")
         return
-    names = [r["description"] or "" for r in rows]
-    cat_names = await asyncio.to_thread(categorize_many, user_id, names)
-    for row, cat_name in zip(rows, cat_names):
-        row["category"] = cat_name
+    # Категорию из файла уважаем, если такая категория у пользователя есть -
+    # иначе своя же выгрузка теряла бы категории при обратном импорте.
+    # Угадываем только там, где колонки не было или название незнакомое.
+    known_categories = {c["name"] for c in db.get_categories(user_id)}
+    need_guess = [
+        index for index, row in enumerate(rows)
+        if (row.get("category") or "") not in known_categories
+    ]
+    if need_guess:
+        names = [rows[index]["description"] or "" for index in need_guess]
+        cat_names = await asyncio.to_thread(categorize_many, user_id, names)
+        for index, cat_name in zip(need_guess, cat_names):
+            rows[index]["category"] = cat_name
     db.save_state(IMPORT_SCOPE, import_id, rows, user_id=user_id)
     pm_id = db.get_default_payment_method_id(user_id)
     count = await asyncio.to_thread(
