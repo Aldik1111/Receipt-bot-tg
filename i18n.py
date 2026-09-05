@@ -1,209 +1,222 @@
 """
-Мультиязычность интерфейса. Три языка: ru (по умолчанию), kk (казахский), en.
+Мультиязычность интерфейса: ru / kk / en.
 
-t(key, lang, **kwargs) - достаёт строку по ключу и языку, подставляет
-плейсхолдеры через .format(). Если для языка нет перевода конкретного ключа -
-тихо откатывается на русский, а если и там нет - возвращает сам ключ (чтобы
-в проде не падать, а просто было видно, что забыли перевести).
+Тексты лежат в locales/{lang}.json. t(key, lang, **kwargs) подставляет
+плейсхолдеры через str.format. Если ключа нет в выбранном языке — берётся
+русский, иначе сам ключ.
 
-Это покрывает основные экраны (start/help, быстрый ввод, статистика,
-категории/оплаты, бюджеты/цели/повторы, язык, дайджест). Более редкие
-сообщения (отдельные ошибки валидации) пока остаются на русском - легко
-дополнить, просто добавив ключ в словари ниже.
+Пользовательские названия (категории, магазины, цели, описания) не переводятся.
 """
 
-LANGUAGES = {"ru": "Русский", "kk": "Қазақша", "en": "English"}
+from __future__ import annotations
 
-TRANSLATIONS: dict[str, dict[str, str]] = {
-    "ru": {
-        "start_greeting": "Привет! Я твой бюджетный менеджер.\n\n",
-        "help_text": (
-            "🤖 <b>Что я умею</b>\n\n"
-            "⚡️ <b>Быстрый ввод</b> - напиши сообщением сумму и что купил:\n"
-            "<code>500 такси</code> - расход, <code>+50000 зарплата</code> - доход.\n"
-            "Категория подбирается автоматически, поправить можно кнопкой под сообщением.\n\n"
-            "📸 <b>Фото чека</b> - пришли фото, я распознаю магазин, товары, цены и разложу "
-            "по категориям.\n\n"
-            "➕ /add - пошаговое добавление операции\n"
-            "📋 /recent - список последних операций, можно править и удалять\n"
-            "📊 /stats - статистика за период (в т.ч. свой)\n"
-            "🔍 /category_stats - аналитика по одной категории\n"
-            "🏷 /categories - свои категории\n"
-            "💳 /payments - способы оплаты\n"
-            "💰 /budget - лимиты по категориям\n"
-            "🎯 /goals - накопительные цели\n"
-            "🔁 /recurring - повторяющиеся платежи\n"
-            "📤 /export - выгрузить операции в файл\n"
-            "🔔 /digest - автосводка и AI-инсайты по расписанию\n"
-            "⚙️ /settings - язык, автосводка, напоминания, импорт из банков, удаление данных\n"
-            "📨 Перешли уведомление банка (после включения импорта в /settings) - "
-            "распознаю платёж автоматически\n"
-            "📎 Пришли CSV/Excel из другого приложения - предложу импортировать\n"
-            "🌐 /language - сменить язык\n"
-            "❓ /help - это сообщение"
-        ),
-        "recorded": "Записано: {amount} — {desc}",
-        "no_description": "без описания",
-        "category_label": "Категория",
-        "edit_button": "✏️ Изменить",
-        "back_button": "◀️ Назад",
-        "cancel_button": "◀️ Отмена",
-        "delete_button": "🗑",
-        "confirm_delete": "✅ Да, удалить",
-        "save_button": "✅ Сохранить",
-        "add_button": "➕ Добавить",
-        "period_day": "Сегодня",
-        "period_week": "Неделя",
-        "period_month": "Месяц",
-        "period_3months": "3 месяца",
-        "period_year": "Год",
-        "period_custom": "📅 Свой период",
-        "stats_title": "📊 Статистика {label}",
-        "expenses": "💸 Расходы",
-        "income": "💰 Доходы",
-        "balance": "Баланс",
-        "vs_prev": "к прошлому периоду",
-        "categories_title": "🏷 Твои категории",
-        "payments_title": "💳 Твои способы оплаты",
-        "language_prompt": "Выбери язык интерфейса:",
-        "language_set": "✅ Готово, теперь на русском.",
-        "digest_prompt": "Как часто присылать автосводку со статистикой и AI-инсайтом?",
-        "digest_off": "Выключить",
-        "digest_day": "Каждый день",
-        "digest_week": "Каждую неделю",
-        "digest_month": "Каждый месяц",
-        "digest_year": "Каждый год",
-        "digest_set": "✅ Автосводка: {freq}",
-        "export_prompt": "За какой период выгрузить операции?",
-        "export_format_prompt": "В каком формате?",
-    },
-    "kk": {
-        "start_greeting": "Сәлем! Мен сенің бюджет менеджеріңмін.\n\n",
-        "help_text": (
-            "🤖 <b>Мен не істей аламын</b>\n\n"
-            "⚡️ <b>Жылдам енгізу</b> - сомасын және не сатып алғаныңды жаз:\n"
-            "<code>500 такси</code> - шығын, <code>+50000 жалақы</code> - кіріс.\n"
-            "Санат автоматты түрде таңдалады, хабарлама астындағы батырмамен түзетуге болады.\n\n"
-            "📸 <b>Чек фотосы</b> - фото жібер, дүкенді, тауарларды, бағаларды танып, "
-            "санаттарға бөлемін.\n\n"
-            "➕ /add - операцияны қадам сайын қосу\n"
-            "📋 /recent - соңғы операциялар тізімі, түзетуге/өшіруге болады\n"
-            "📊 /stats - кезең бойынша статистика (өз кезеңің де болады)\n"
-            "🔍 /category_stats - бір санат бойынша аналитика\n"
-            "🏷 /categories - өз санаттарың\n"
-            "💳 /payments - төлем әдістері\n"
-            "💰 /budget - санаттар бойынша лимиттер\n"
-            "🎯 /goals - жинақтау мақсаттары\n"
-            "🔁 /recurring - қайталанатын төлемдер\n"
-            "📤 /export - операцияларды файлға шығару\n"
-            "🔔 /digest - кесте бойынша авто-жинақ және AI-түсінік\n"
-            "⚙️ /settings - тіл, авто-жинақ, еске салулар, банктен импорт, деректерді өшіру\n"
-            "📨 Банк хабарламасын қайта жіберші (алдымен /settings-те импортты қос) - "
-            "төлемді автоматты танимын\n"
-            "📎 Басқа қосымшадан CSV/Excel жібер - импорттауды ұсынамын\n"
-            "🌐 /language - тілді ауыстыру\n"
-            "❓ /help - осы хабарлама"
-        ),
-        "recorded": "Жазылды: {amount} — {desc}",
-        "no_description": "сипаттамасыз",
-        "category_label": "Санат",
-        "edit_button": "✏️ Өзгерту",
-        "back_button": "◀️ Артқа",
-        "cancel_button": "◀️ Бас тарту",
-        "delete_button": "🗑",
-        "confirm_delete": "✅ Иә, өшіру",
-        "save_button": "✅ Сақтау",
-        "add_button": "➕ Қосу",
-        "period_day": "Бүгін",
-        "period_week": "Апта",
-        "period_month": "Ай",
-        "period_3months": "3 ай",
-        "period_year": "Жыл",
-        "period_custom": "📅 Өз кезеңім",
-        "stats_title": "📊 Статистика ({label})",
-        "expenses": "💸 Шығындар",
-        "income": "💰 Кірістер",
-        "balance": "Баланс",
-        "vs_prev": "өткен кезеңмен салыстырғанда",
-        "categories_title": "🏷 Сенің санаттарың",
-        "payments_title": "💳 Сенің төлем әдістерің",
-        "language_prompt": "Интерфейс тілін таңда:",
-        "language_set": "✅ Дайын, енді қазақша.",
-        "digest_prompt": "Статистика мен AI-түсінікті қаншалықты жиі жіберу керек?",
-        "digest_off": "Өшіру",
-        "digest_day": "Күн сайын",
-        "digest_week": "Апта сайын",
-        "digest_month": "Ай сайын",
-        "digest_year": "Жыл сайын",
-        "digest_set": "✅ Авто-жинақ: {freq}",
-        "export_prompt": "Қай кезең үшін операцияларды шығару керек?",
-        "export_format_prompt": "Қандай форматта?",
-    },
-    "en": {
-        "start_greeting": "Hi! I'm your budget manager.\n\n",
-        "help_text": (
-            "🤖 <b>What I can do</b>\n\n"
-            "⚡️ <b>Quick add</b> - just type the amount and what you bought:\n"
-            "<code>500 taxi</code> - expense, <code>+50000 salary</code> - income.\n"
-            "Category is picked automatically, tap the button under the message to fix it.\n\n"
-            "📸 <b>Receipt photo</b> - send a photo, I'll recognize the store, items, prices "
-            "and sort them into categories.\n\n"
-            "➕ /add - add an entry step by step\n"
-            "📋 /recent - recent entries, edit or delete any of them\n"
-            "📊 /stats - stats for a period (including a custom range)\n"
-            "🔍 /category_stats - detailed analytics for one category\n"
-            "🏷 /categories - your categories\n"
-            "💳 /payments - payment methods\n"
-            "💰 /budget - monthly limits per category\n"
-            "🎯 /goals - savings goals\n"
-            "🔁 /recurring - recurring payments\n"
-            "📤 /export - export entries to a file\n"
-            "🔔 /digest - scheduled summary + AI insight\n"
-            "⚙️ /settings - language, digest, reminders, bank import, delete all data\n"
-            "📨 Forward a bank notification (after enabling import in /settings) - "
-            "I'll try to recognize the payment\n"
-            "📎 Send a CSV/Excel from another app - I'll offer to import it\n"
-            "🌐 /language - change language\n"
-            "❓ /help - this message"
-        ),
-        "recorded": "Recorded: {amount} — {desc}",
-        "no_description": "no description",
-        "category_label": "Category",
-        "edit_button": "✏️ Edit",
-        "back_button": "◀️ Back",
-        "cancel_button": "◀️ Cancel",
-        "delete_button": "🗑",
-        "confirm_delete": "✅ Yes, delete",
-        "save_button": "✅ Save",
-        "add_button": "➕ Add",
-        "period_day": "Today",
-        "period_week": "Week",
-        "period_month": "Month",
-        "period_3months": "3 months",
-        "period_year": "Year",
-        "period_custom": "📅 Custom period",
-        "stats_title": "📊 Stats — {label}",
-        "expenses": "💸 Expenses",
-        "income": "💰 Income",
-        "balance": "Balance",
-        "vs_prev": "vs previous period",
-        "categories_title": "🏷 Your categories",
-        "payments_title": "💳 Your payment methods",
-        "language_prompt": "Choose interface language:",
-        "language_set": "✅ Done, now in English.",
-        "digest_prompt": "How often should I send a summary with stats and an AI insight?",
-        "digest_off": "Turn off",
-        "digest_day": "Every day",
-        "digest_week": "Every week",
-        "digest_month": "Every month",
-        "digest_year": "Every year",
-        "digest_set": "✅ Auto-summary: {freq}",
-        "export_prompt": "Which period to export?",
-        "export_format_prompt": "In which format?",
-    },
+import json
+from datetime import date, datetime
+from functools import lru_cache
+from pathlib import Path
+
+from aiogram.types import BotCommand
+
+from config import CURRENCY_SYMBOL, PRIVACY_POLICY_VERSION
+from money import tiyn_to_tenge
+
+LANGUAGES = {"ru": "Русский", "kk": "Қазақша", "en": "English"}
+PRIVACY_VERSION = PRIVACY_POLICY_VERSION
+LOCALES_DIR = Path(__file__).resolve().parent / "locales"
+
+WEEKDAYS = {
+    "ru": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"],
+    "kk": ["Дс", "Сс", "Ср", "Бс", "Жм", "Сн", "Жс"],
+    "en": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
 }
+MONTHS = {
+    "ru": ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"],
+    "kk": ["Қаң", "Ақп", "Нау", "Сәу", "Мам", "Мау", "Шіл", "Там", "Қыр", "Қаз", "Қар", "Жел"],
+    "en": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+}
+
+BOT_COMMAND_KEYS = (
+    ("start", "cmd_start"),
+    ("help", "cmd_help"),
+    ("add", "cmd_add"),
+    ("today", "cmd_today"),
+    ("recent", "cmd_recent"),
+    ("search", "cmd_search"),
+    ("stats", "cmd_stats"),
+    ("category_stats", "cmd_category_stats"),
+    ("categories", "cmd_categories"),
+    ("payments", "cmd_payments"),
+    ("budget", "cmd_budget"),
+    ("goals", "cmd_goals"),
+    ("recurring", "cmd_recurring"),
+    ("export", "cmd_export"),
+    ("digest", "cmd_digest"),
+    ("settings", "cmd_settings"),
+    ("language", "cmd_language"),
+    ("privacy", "cmd_privacy"),
+    ("feedback", "cmd_feedback"),
+    ("family", "cmd_family"),
+    ("pro", "cmd_pro"),
+    ("cancel", "cmd_cancel"),
+)
+
+MINIAPP_KEYS = (
+    "app_title",
+    "tab_overview",
+    "tab_budgets",
+    "tab_goals",
+    "period_week",
+    "period_month",
+    "period_3months",
+    "period_year",
+    "period_custom",
+    "custom_apply",
+    "all_categories",
+    "expenses",
+    "income",
+    "balance",
+    "by_categories",
+    "transactions_title",
+    "back_button",
+    "more_button",
+    "no_transactions",
+    "no_budgets",
+    "no_goals",
+    "no_description",
+    "uncategorized",
+    "overall_expenses",
+    "load_error",
+    "add_button",
+    "save_button",
+    "cancel_button",
+    "edit_button",
+    "form_amount",
+    "form_type",
+    "form_category",
+    "form_date",
+    "form_description",
+    "form_store",
+    "form_payment",
+    "type_expense",
+    "type_income",
+    "created_ok",
+    "updated_ok",
+    "save_error",
+    "validation_error",
+)
+
+
+@lru_cache(maxsize=8)
+def _load_locale(lang: str) -> dict[str, str]:
+    path = LOCALES_DIR / f"{lang}.json"
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): str(value) for key, value in data.items()}
+
+
+def supported_languages() -> tuple[str, ...]:
+    return tuple(LANGUAGES)
+
+
+def translation_gaps() -> dict[str, list[str]]:
+    """Ключи, которых нет в каком-то языке относительно русского."""
+    ru_keys = set(_load_locale("ru"))
+    gaps: dict[str, list[str]] = {}
+    for lang in LANGUAGES:
+        missing = sorted(ru_keys - set(_load_locale(lang)))
+        extra = sorted(set(_load_locale(lang)) - ru_keys)
+        if missing or extra:
+            gaps[lang] = [f"-{key}" for key in missing] + [f"+{key}" for key in extra]
+    return gaps
 
 
 def t(key: str, lang: str = "ru", **kwargs) -> str:
-    text = TRANSLATIONS.get(lang, {}).get(key) or TRANSLATIONS["ru"].get(key) or key
+    text = _load_locale(lang).get(key) or _load_locale("ru").get(key) or key
     return text.format(**kwargs) if kwargs else text
+
+
+def ut(user_id: int, key: str, **kwargs) -> str:
+    import db
+
+    return t(key, db.get_user_language(user_id), **kwargs)
+
+
+def normalize_lang(lang: str | None) -> str:
+    if lang in LANGUAGES:
+        return lang
+    if lang:
+        prefix = lang.split("-", 1)[0].lower()
+        if prefix in LANGUAGES:
+            return prefix
+    return "ru"
+
+
+def bot_commands(lang: str) -> list[BotCommand]:
+    return [
+        BotCommand(command=command, description=t(key, lang))
+        for command, key in BOT_COMMAND_KEYS
+    ]
+
+
+def miniapp_bundle(lang: str) -> dict[str, str]:
+    return {key: t(key, lang) for key in MINIAPP_KEYS}
+
+
+def format_date(value, lang: str = "ru") -> str:
+    if value is None or value == "":
+        return t("dash", lang)
+    if isinstance(value, datetime):
+        day = value.date()
+    elif isinstance(value, date):
+        day = value
+    else:
+        text = str(value)
+        try:
+            day = date.fromisoformat(text[:10])
+        except ValueError:
+            return text
+    if lang == "en":
+        return f"{day.day} {MONTHS['en'][day.month - 1]} {day.year}"
+    return day.strftime("%d.%m.%Y")
+
+
+def format_money(amount_tiyn, lang: str = "ru") -> str:
+    try:
+        tiyn = int(amount_tiyn)
+    except (TypeError, ValueError):
+        tiyn = 0
+    sign = "-" if tiyn < 0 else ""
+    tiyn = abs(tiyn)
+    tenge, frac = divmod(tiyn, 100)
+    if lang == "en":
+        whole = f"{tenge:,}"
+        if frac:
+            return f"{sign}{whole}.{frac:02d} {CURRENCY_SYMBOL}"
+        return f"{sign}{whole} {CURRENCY_SYMBOL}"
+    whole = f"{tenge:,}".replace(",", " ")
+    if frac:
+        return f"{sign}{whole},{frac:02d} {CURRENCY_SYMBOL}"
+    return f"{sign}{whole} {CURRENCY_SYMBOL}"
+
+
+def type_label(tx_type: str, lang: str = "ru") -> str:
+    return {
+        "expense": t("type_expense", lang),
+        "income": t("type_income", lang),
+        "transfer": t("type_transfer", lang),
+    }.get(tx_type, t("type_expense", lang))
+
+
+def weekday_short(day: date, lang: str = "ru") -> str:
+    return WEEKDAYS.get(lang, WEEKDAYS["ru"])[day.weekday()]
+
+
+def month_short(day: date, lang: str = "ru") -> str:
+    return MONTHS.get(lang, MONTHS["ru"])[day.month - 1]
+
+
+# Совместимость со старым импортом TRANSLATIONS в тестах/отладке.
+TRANSLATIONS = {lang: _load_locale(lang) for lang in LANGUAGES}

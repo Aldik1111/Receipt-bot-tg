@@ -15,11 +15,13 @@ from aiohttp import web
 
 import db
 from categorizer import categorize  # noqa: F401 - не используется напрямую, но держим импорт рядом с db
-from config import BOT_TOKEN
-from formatting import money
+from config import BOT_TOKEN, WEBAPP_HOST, WEBAPP_PORT
+from formatting import money, parse_positive_amount
+from i18n import PRIVACY_VERSION, format_date, format_money, miniapp_bundle, normalize_lang, t
+from logutil import configure_logging
 from webapp_auth import validate_init_data
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 routes = web.RouteTableDef()
@@ -55,8 +57,7 @@ def _parse_custom_dates(request: web.Request) -> tuple[str, str] | web.Response 
     return date_from, date_to
 
 
-def _period_bounds(period: str) -> tuple[str, str]:
-    today = date.today()
+def _period_bounds(period: str, today: date) -> tuple[str, str]:
     if period == "week":
         start = today - timedelta(days=today.weekday())
     elif period == "3months":
@@ -80,10 +81,12 @@ async def health_check(request: web.Request) -> web.Response:
     только если реально можем достучаться до базы, а не просто "процесс жив"."""
     try:
         db.count_all_transactions(0)  # лёгкий запрос, user_id=0 никогда не существует
-        return web.json_response({"status": "ok"})
+        health = db.scheduler_health()
+        status = "ok" if health.get("schedulers_ok", True) else "degraded"
+        return web.json_response({"status": status, "db": "ok", **health})
     except Exception:
         logger.exception("Health check: БД недоступна")
-        return web.json_response({"status": "error"}, status=500)
+        return web.json_response({"status": "error", "db": "error"}, status=500)
 
 
 @routes.get("/api/summary")
@@ -99,20 +102,21 @@ async def get_summary(request: web.Request) -> web.Response:
     if parsed:
         date_from, date_to = parsed
     else:
-        date_from, date_to = _period_bounds(period)
+        date_from, date_to = _period_bounds(period, db.user_today(user_id))
     rows = db.get_transactions(user_id, date_from, date_to)
-    expense = sum(r["amount"] for r in rows if r["type"] == "expense")
-    income = sum(r["amount"] for r in rows if r["type"] == "income")
+    expense = sum(int(r["amount"]) for r in rows if r["type"] == "expense")
+    income = sum(int(r["amount"]) for r in rows if r["type"] == "income")
 
     return web.json_response({
         "date_from": date_from,
         "date_to": date_to,
+        "timezone": db.get_user_timezone(user_id),
         "expense": expense,
         "income": income,
         "balance": income - expense,
-        "expense_formatted": money(expense),
-        "income_formatted": money(income),
-        "balance_formatted": money(income - expense),
+        "expense_formatted": format_money(expense, db.get_user_language(user_id)),
+        "income_formatted": format_money(income, db.get_user_language(user_id)),
+        "balance_formatted": format_money(income - expense, db.get_user_language(user_id)),
     })
 
 
@@ -129,16 +133,16 @@ async def get_categories_breakdown(request: web.Request) -> web.Response:
     if parsed:
         date_from, date_to = parsed
     else:
-        date_from, date_to = _period_bounds(period)
+        date_from, date_to = _period_bounds(period, db.user_today(user_id))
     rows = db.get_transactions(user_id, date_from, date_to)
     expenses = [r for r in rows if r["type"] == "expense"]
-    total = sum(r["amount"] for r in expenses)
+    total = sum(int(r["amount"]) for r in expenses)
 
-    totals: dict[str, float] = {}
+    totals: dict[str, int] = {}
     emojis: dict[str, str] = {}
     for r in expenses:
-        name = r["category_name"] or "Без категории"
-        totals[name] = totals.get(name, 0) + r["amount"]
+        name = r["category_name"] or t("uncategorized", db.get_user_language(user_id))
+        totals[name] = totals.get(name, 0) + int(r["amount"])
         emojis[name] = r["category_emoji"] or "🏷"
 
     items = [
@@ -155,8 +159,204 @@ async def get_category_list(request: web.Request) -> web.Response:
     user_id = _authenticate(request)
     if not user_id:
         return web.json_response({"error": "unauthorized"}, status=401)
-    items = [{"name": c["name"], "emoji": c["emoji"]} for c in db.get_categories(user_id)]
+    items = [
+        {"id": c["id"], "name": c["name"], "emoji": c["emoji"]}
+        for c in db.get_categories(user_id)
+    ]
     return web.json_response({"items": items})
+
+
+def _serialize_tx(row, lang: str) -> dict:
+    return {
+        "id": row["id"],
+        "type": row["type"],
+        "amount": int(row["amount"]),
+        "amount_formatted": format_money(row["amount"], lang),
+        "category": row["category_name"],
+        "category_id": row["category_id"],
+        "category_emoji": row["category_emoji"] or "🏷",
+        "payment": row["payment_name"],
+        "payment_method_id": row["payment_method_id"],
+        "store": row["store"],
+        "description": row["description"],
+        "date": row["op_date"],
+        "date_formatted": format_date(row["op_date"], lang),
+        "time": row["op_time"],
+    }
+
+
+def _parse_tx_payload(payload: dict, user_id: int) -> tuple[dict | None, web.Response | None]:
+    if not isinstance(payload, dict):
+        return None, web.json_response({"error": "invalid json"}, status=400)
+
+    tx_type = payload.get("type")
+    if tx_type not in ("expense", "income"):
+        return None, web.json_response({"error": "invalid type"}, status=400)
+
+    amount = parse_positive_amount(str(payload.get("amount", "")))
+    if amount is None:
+        return None, web.json_response({"error": "invalid amount"}, status=400)
+
+    try:
+        category_id = int(payload.get("category_id"))
+    except (TypeError, ValueError):
+        return None, web.json_response({"error": "invalid category"}, status=400)
+    if db.get_category_name(user_id, category_id) is None:
+        return None, web.json_response({"error": "category not found"}, status=403)
+
+    op_date = payload.get("date") or db.user_today(user_id).isoformat()
+    try:
+        date.fromisoformat(str(op_date))
+    except ValueError:
+        return None, web.json_response({"error": "invalid date"}, status=400)
+
+    payment_method_id = payload.get("payment_method_id")
+    if payment_method_id in ("", None):
+        payment_method_id = None
+    else:
+        try:
+            payment_method_id = int(payment_method_id)
+        except (TypeError, ValueError):
+            return None, web.json_response({"error": "invalid payment"}, status=400)
+        owned = {row["id"] for row in db.get_payment_methods(user_id)}
+        if payment_method_id not in owned:
+            return None, web.json_response({"error": "payment not found"}, status=403)
+
+    description = payload.get("description")
+    if description is not None:
+        description = str(description).strip()[:500] or None
+    store = payload.get("store")
+    if store is not None:
+        store = str(store).strip()[:128] or None
+
+    return {
+        "type": tx_type,
+        "amount": amount,
+        "category_id": category_id,
+        "date": str(op_date),
+        "description": description,
+        "store": store,
+        "payment_method_id": payment_method_id,
+    }, None
+
+
+@routes.get("/api/me")
+async def get_me(request: web.Request) -> web.Response:
+    user_id = _authenticate(request)
+    if not user_id:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    lang = normalize_lang(db.get_user_language(user_id))
+    return web.json_response({
+        "language": lang,
+        "timezone": db.get_user_timezone(user_id),
+        "today": db.user_today(user_id).isoformat(),
+        "onboarded": db.is_onboarded(user_id),
+        "privacy_accepted_version": db.get_privacy_accepted_version(user_id),
+        "privacy_current_version": PRIVACY_VERSION,
+        "plan": db.user_plan_info(user_id)["plan"],
+        "can_write": db.can_write_book(user_id),
+        "translations": miniapp_bundle(lang),
+        "categories": [
+            {"id": c["id"], "name": c["name"], "emoji": c["emoji"]}
+            for c in db.get_categories(user_id)
+        ],
+        "payments": [
+            {"id": p["id"], "name": p["name"]}
+            for p in db.get_payment_methods(user_id)
+        ],
+    })
+
+
+@routes.post("/api/transactions")
+async def create_transaction(request: web.Request) -> web.Response:
+    user_id = _authenticate(request)
+    if not user_id:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, TypeError):
+        return web.json_response({"error": "invalid json"}, status=400)
+    parsed, error = _parse_tx_payload(payload, user_id)
+    if error is not None:
+        return error
+    if not db.can_write_book(user_id):
+        return web.json_response({"error": "read-only"}, status=403)
+    now = db.user_now(user_id)
+    tx_id = db.add_transaction(
+        user_id=user_id,
+        tx_type=parsed["type"],
+        amount=parsed["amount"],
+        category_id=parsed["category_id"],
+        payment_method_id=parsed["payment_method_id"],
+        store=parsed["store"],
+        description=parsed["description"],
+        op_date=parsed["date"],
+        op_time=now.strftime("%H:%M"),
+    )
+    db.touch_activity(user_id, now.date().isoformat())
+    row = db.get_transaction_by_id(user_id, tx_id)
+    lang = db.get_user_language(user_id)
+    return web.json_response(_serialize_tx(row, lang), status=201)
+
+
+@routes.patch("/api/transactions/{tx_id}")
+async def update_transaction(request: web.Request) -> web.Response:
+    user_id = _authenticate(request)
+    if not user_id:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        tx_id = int(request.match_info["tx_id"])
+    except (TypeError, ValueError):
+        return web.json_response({"error": "invalid id"}, status=400)
+    row = db.get_transaction_by_id(user_id, tx_id)
+    if row is None:
+        return web.json_response({"error": "not found"}, status=404)
+    if not db.can_write_book(user_id):
+        return web.json_response({"error": "read-only"}, status=403)
+    if row["type"] == "transfer":
+        return web.json_response({"error": "transfer is read-only"}, status=409)
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, TypeError):
+        return web.json_response({"error": "invalid json"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    merged = {
+        "type": payload.get("type", row["type"]),
+        "amount": payload.get("amount", money_input_from_tiyn(row["amount"])),
+        "category_id": payload.get("category_id", row["category_id"]),
+        "date": payload.get("date", row["op_date"]),
+        "description": payload.get("description", row["description"]),
+        "store": payload.get("store", row["store"]),
+        "payment_method_id": payload.get(
+            "payment_method_id", row["payment_method_id"]
+        ),
+    }
+    parsed, error = _parse_tx_payload(merged, user_id)
+    if error is not None:
+        return error
+    ok = (
+        db.update_transaction_type(user_id, tx_id, parsed["type"])
+        and db.update_transaction_amount(user_id, tx_id, parsed["amount"])
+        and db.update_transaction_category(user_id, tx_id, parsed["category_id"])
+        and db.update_transaction_date(user_id, tx_id, parsed["date"])
+        and db.update_transaction_description(user_id, tx_id, parsed["description"])
+        and db.update_transaction_store(user_id, tx_id, parsed["store"])
+        and db.update_transaction_payment_method(
+            user_id, tx_id, parsed["payment_method_id"]
+        )
+    )
+    if not ok:
+        return web.json_response({"error": "update failed"}, status=400)
+    lang = db.get_user_language(user_id)
+    return web.json_response(_serialize_tx(db.get_transaction_by_id(user_id, tx_id), lang))
+
+
+def money_input_from_tiyn(amount_tiyn: int) -> str:
+    from money import tiyn_to_tenge
+
+    return str(tiyn_to_tenge(int(amount_tiyn)))
 
 
 @routes.get("/api/transactions")
@@ -186,7 +386,7 @@ async def get_transactions_list(request: web.Request) -> web.Response:
     elif request.query.get("period"):
         # Mini App использует period, а не явные даты. Раньше endpoint его
         # игнорировал: карточки были за месяц, список операций — за всё время.
-        date_from, date_to = _period_bounds(request.query["period"])
+        date_from, date_to = _period_bounds(request.query["period"], db.user_today(user_id))
 
     category_name = category if category and category != "all" else None
     rows = db.get_recent_transactions(
@@ -204,19 +404,8 @@ async def get_transactions_list(request: web.Request) -> web.Response:
         category_name=category_name,
     )
 
-    items = [{
-        "id": r["id"],
-        "type": r["type"],
-        "amount": r["amount"],
-        "amount_formatted": money(r["amount"]),
-        "category": r["category_name"],
-        "category_emoji": r["category_emoji"] or "🏷",
-        "payment": r["payment_name"],
-        "store": r["store"],
-        "description": r["description"],
-        "date": r["op_date"],
-        "time": r["op_time"],
-    } for r in rows]
+    lang = db.get_user_language(user_id)
+    items = [_serialize_tx(r, lang) for r in rows]
     return web.json_response({"items": items, "total": total_count})
 
 
@@ -226,15 +415,21 @@ async def get_budgets_status(request: web.Request) -> web.Response:
     if not user_id:
         return web.json_response({"error": "unauthorized"}, status=401)
 
-    today = date.today()
+    today = db.user_today(user_id)
     start = today.replace(day=1)
     items = []
     for b in db.get_budgets(user_id):
-        spent = db.get_category_spent(user_id, b["category_id"], start.isoformat(), today.isoformat())
+        if b["category_id"] is None:
+            spent = db.get_total_expense(user_id, start.isoformat(), today.isoformat())
+            category = t("overall_expenses", db.get_user_language(user_id))
+        else:
+            spent = db.get_category_spent(user_id, b["category_id"], start.isoformat(), today.isoformat())
+            category = b["category_name"]
         items.append({
-            "category": b["category_name"],
-            "spent": spent,
-            "limit": b["monthly_limit"],
+            "category": category,
+            "overall": b["category_id"] is None,
+            "spent": int(spent),
+            "limit": int(b["monthly_limit"]),
             "pct": (spent / b["monthly_limit"] * 100) if b["monthly_limit"] else 0,
             "spent_formatted": money(spent),
             "limit_formatted": money(b["monthly_limit"]),
@@ -251,13 +446,18 @@ async def get_goals_status(request: web.Request) -> web.Response:
     items = [{
         "id": g["id"],
         "name": g["name"],
-        "current": g["current_amount"],
-        "target": g["target_amount"],
+        "current": int(g["current_amount"]),
+        "target": int(g["target_amount"]),
+        "deadline": g["deadline"],
         "pct": (g["current_amount"] / g["target_amount"] * 100) if g["target_amount"] else 0,
         "current_formatted": money(g["current_amount"]),
         "target_formatted": money(g["target_amount"]),
     } for g in db.get_goals(user_id)]
     return web.json_response({"items": items})
+
+
+async def _on_shutdown(app: web.Application) -> None:
+    logger.info("webapp shutting down")
 
 
 def create_app() -> web.Application:
@@ -266,8 +466,14 @@ def create_app() -> web.Application:
     db.init_db()
     app = web.Application()
     app.add_routes(routes)
+    app.on_shutdown.append(_on_shutdown)
     return app
 
 
 if __name__ == "__main__":
-    web.run_app(create_app(), host="127.0.0.1", port=8000)
+    web.run_app(
+        create_app(),
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+        handle_signals=True,
+    )

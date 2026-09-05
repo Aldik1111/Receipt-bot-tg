@@ -11,7 +11,6 @@
 import base64
 import json
 import logging
-import math
 import re
 import time
 from datetime import date, datetime
@@ -19,6 +18,7 @@ from datetime import date, datetime
 import requests
 
 from config import GEMINI_API_KEY, GEMINI_MODEL
+from money import MoneyError, tenge_to_tiyn
 
 logger = logging.getLogger(__name__)
 
@@ -60,24 +60,14 @@ def _guess_mime_type(image_path: str) -> str:
     return "image/jpeg"
 
 
-def _parse_item_price(value) -> float | None:
-    if value is None:
+def _parse_item_price(value) -> int | None:
+    """Цена из JSON Gemini — тенге; возвращаем целые тиыны."""
+    if value is None or isinstance(value, bool):
         return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-        if math.isfinite(number) and number > 0:
-            return number
-        return None
-    text = str(value).strip().replace(" ", "").replace("\u00a0", "").replace(",", ".")
     try:
-        number = float(text)
-    except ValueError:
+        return tenge_to_tiyn(value)
+    except MoneyError:
         return None
-    if math.isfinite(number) and number > 0:
-        return number
-    return None
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -149,7 +139,7 @@ def sanitize_gemini_receipt(data: dict) -> dict | None:
     }
 
 
-def _post_gemini(body: dict) -> dict | None:
+def _post_gemini(body: dict) -> tuple[dict | None, str | None]:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     headers = {
         "Content-Type": "application/json",
@@ -159,33 +149,38 @@ def _post_gemini(body: dict) -> dict | None:
     for attempt in range(3):
         try:
             response = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-            if response.status_code in (429, 500, 502, 503, 504):
-                last_error = response.status_code
+            if response.status_code == 429:
+                last_error = "rate_limit"
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if response.status_code in (500, 502, 503, 504):
+                last_error = "network"
                 time.sleep(1.5 * (attempt + 1))
                 continue
             if not response.ok:
                 logger.error(
                     "Gemini API вернул %s: %s", response.status_code, response.text[:500]
                 )
-                return None
-            return response.json()
+                return None, "unavailable"
+            return response.json(), None
         except requests.RequestException:
             logger.exception("Сеть Gemini, попытка %s", attempt + 1)
+            last_error = "network"
             time.sleep(1.5 * (attempt + 1))
     if last_error:
-        logger.error("Gemini недоступен после повторов, последний код %s", last_error)
-    return None
+        logger.error("Gemini недоступен после повторов, причина %s", last_error)
+        return None, last_error
+    return None, "unavailable"
 
 
-def get_receipt_from_gemini(image_path: str) -> dict | None:
+def get_receipt_from_gemini(image_path: str) -> tuple[dict | None, str | None]:
     if not GEMINI_API_KEY:
         logger.info("GEMINI_API_KEY не задан - шаг с Gemini пропускается")
-        return None
+        return None, "no_key"
 
     with open(image_path, "rb") as f:
         image_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    # Ключ передаём заголовком x-goog-api-key, а не ?key= в URL.
     body = {
         "contents": [
             {
@@ -201,16 +196,21 @@ def get_receipt_from_gemini(image_path: str) -> dict | None:
         },
     }
 
-    payload = _post_gemini(body)
+    payload, err = _post_gemini(body)
+    if err:
+        return None, err
     if not payload:
-        return None
+        return None, "unavailable"
     try:
         text = payload["candidates"][0]["content"]["parts"][0]["text"]
         data = json.loads(text)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError):
         logger.exception("Некорректный ответ Gemini")
-        return None
-    return sanitize_gemini_receipt(data)
+        return None, "bad_json"
+    parsed = sanitize_gemini_receipt(data)
+    if not parsed:
+        return None, "empty"
+    return parsed, None
 
 
 def _text_request(prompt: str, max_tokens: int = 200) -> str | None:
@@ -221,8 +221,8 @@ def _text_request(prompt: str, max_tokens: int = 200) -> str | None:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
     }
-    payload = _post_gemini(body)
-    if not payload:
+    payload, err = _post_gemini(body)
+    if err or not payload:
         return None
     try:
         return payload["candidates"][0]["content"]["parts"][0]["text"].strip()

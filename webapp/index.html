@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>Бюджет</title>
+<title>Budget</title>
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://telegram.org https://cdn.jsdelivr.net 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; object-src 'none'; form-action 'none';">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" integrity="sha384-NrKB+u6Ts6AtkIhwPixiKTzgSKNblyhlk0Sohlgar9UHUBzai/sgnNNWWd291xqt" crossorigin="anonymous"></script>
@@ -15,7 +15,7 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     background: var(--tg-theme-bg-color, #ffffff);
     color: var(--tg-theme-text-color, #111111);
-    padding: 12px 16px 32px;
+    padding: 12px 16px 88px;
   }
   h1 { font-size: 18px; margin: 8px 0 16px; }
   .tabs { display: flex; gap: 6px; margin-bottom: 12px; overflow-x: auto; }
@@ -29,7 +29,7 @@
     background: var(--tg-theme-button-color, #2481cc);
     color: var(--tg-theme-button-text-color, #ffffff);
   }
-  select.tab { -webkit-appearance: none; appearance: none; font-family: inherit; }
+  select.tab, input.tab { -webkit-appearance: none; appearance: none; font-family: inherit; }
   .card {
     background: var(--tg-theme-secondary-bg-color, #f7f7f7);
     border-radius: 12px; padding: 14px 16px; margin-bottom: 12px;
@@ -41,7 +41,8 @@
   .list-item {
     display: flex; justify-content: space-between; align-items: center;
     padding: 10px 0; border-bottom: 1px solid rgba(128,128,128,0.15);
-    font-size: 14px;
+    font-size: 14px; width: 100%; background: none; border-left: 0; border-right: 0; border-top: 0;
+    color: inherit; text-align: left; cursor: pointer;
   }
   .list-item:last-child { border-bottom: none; }
   .list-item .left { display: flex; flex-direction: column; gap: 2px; }
@@ -50,65 +51,107 @@
   .bar-fill { height: 100%; border-radius: 6px; }
   .empty { text-align: center; opacity: 0.5; padding: 24px 0; font-size: 14px; }
   canvas { max-height: 220px; }
-  .section-title { font-size: 14px; font-weight: 600; margin: 18px 0 8px; }
+  .section-title { font-size: 14px; font-weight: 600; margin: 18px 0 8px; display: flex; justify-content: space-between; align-items: center; }
+  .fab {
+    position: fixed; right: 16px; bottom: 16px; width: 52px; height: 52px; border: none; border-radius: 26px;
+    background: var(--tg-theme-button-color, #2481cc); color: var(--tg-theme-button-text-color, #fff);
+    font-size: 28px; line-height: 52px; text-align: center; cursor: pointer;
+  }
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: none; align-items: flex-end; }
+  .modal.open { display: flex; }
+  .sheet { width: 100%; background: var(--tg-theme-bg-color, #fff); border-radius: 16px 16px 0 0; padding: 16px; }
+  label { display: block; font-size: 12px; opacity: 0.7; margin: 10px 0 4px; }
+  input, select, textarea {
+    width: 100%; padding: 10px; border-radius: 10px; border: 1px solid rgba(128,128,128,0.3);
+    background: var(--tg-theme-secondary-bg-color, #f7f7f7); color: inherit; font: inherit;
+  }
+  .actions { display: flex; gap: 8px; margin-top: 16px; }
+  .actions button { flex: 1; padding: 10px; border: none; border-radius: 10px; cursor: pointer; }
+  .primary { background: var(--tg-theme-button-color, #2481cc); color: var(--tg-theme-button-text-color, #fff); }
+  .custom-dates { display: none; gap: 8px; margin-bottom: 12px; }
+  .custom-dates.open { display: flex; flex-wrap: wrap; }
+  .custom-dates input { flex: 1; min-width: 120px; }
 </style>
 </head>
 <body>
 
-<h1>📊 Мой бюджет</h1>
+<h1 id="app-title">Budget</h1>
 
-<div class="tabs">
-  <button class="tab active" data-tab="overview">Обзор и операции</button>
-  <button class="tab" data-tab="budgets">Бюджеты</button>
-  <button class="tab" data-tab="goals">Цели</button>
+<div class="tabs" id="main-tabs">
+  <button class="tab active" data-tab="overview" id="tab-overview">Overview</button>
+  <button class="tab" data-tab="budgets" id="tab-budgets">Budgets</button>
+  <button class="tab" data-tab="goals" id="tab-goals">Goals</button>
 </div>
 
 <div id="view-overview">
   <div class="tabs" id="period-tabs">
-    <button class="tab active" data-period="week">Неделя</button>
-    <button class="tab" data-period="month">Месяц</button>
-    <button class="tab" data-period="3months">3 месяца</button>
-    <button class="tab" data-period="year">Год</button>
+    <button class="tab" data-period="week" id="p-week">Week</button>
+    <button class="tab active" data-period="month" id="p-month">Month</button>
+    <button class="tab" data-period="3months" id="p-3months">3 months</button>
+    <button class="tab" data-period="year" id="p-year">Year</button>
+    <button class="tab" data-period="custom" id="p-custom">Custom</button>
   </div>
-  <select id="category-filter" class="tab" style="width:100%; margin-bottom:12px; padding:8px;">
-    <option value="all">Все категории</option>
-  </select>
+  <div class="custom-dates" id="custom-dates">
+    <input type="date" id="date-from">
+    <input type="date" id="date-to">
+    <button class="tab" id="custom-apply" type="button">Show</button>
+  </div>
+  <select id="category-filter" class="tab" style="width:100%; margin-bottom:12px; padding:8px;"></select>
 
   <div class="row">
     <div class="card">
-      <div class="card-title">💸 Расходы</div>
+      <div class="card-title" id="lbl-expense">Expenses</div>
       <div class="card-value" id="expense-value">—</div>
     </div>
     <div class="card">
-      <div class="card-title">💰 Доходы</div>
+      <div class="card-title" id="lbl-income">Income</div>
       <div class="card-value" id="income-value">—</div>
     </div>
   </div>
   <div class="card">
-    <div class="card-title">Баланс</div>
+    <div class="card-title" id="lbl-balance">Balance</div>
     <div class="card-value" id="balance-value">—</div>
   </div>
-
   <div class="card">
-    <div class="card-title">По категориям</div>
+    <div class="card-title" id="lbl-by-cat">By category</div>
     <canvas id="category-chart"></canvas>
   </div>
-
-  <div class="section-title">Операции</div>
+  <div class="section-title">
+    <span id="lbl-tx">Transactions</span>
+  </div>
   <div class="card" id="transactions-list"></div>
   <div id="tx-pager" class="tabs" style="display:none;margin-top:8px">
-    <button class="tab" id="tx-prev" type="button">Назад</button>
-    <button class="tab" id="tx-next" type="button">Ещё</button>
+    <button class="tab" id="tx-prev" type="button">Back</button>
+    <button class="tab" id="tx-next" type="button">More</button>
   </div>
 </div>
 <div id="app-error" class="empty" style="display:none"></div>
+<div id="view-budgets" style="display:none"><div class="card" id="budgets-list"></div></div>
+<div id="view-goals" style="display:none"><div class="card" id="goals-list"></div></div>
+<button class="fab" id="fab-add" type="button">+</button>
 
-<div id="view-budgets" style="display:none">
-  <div class="card" id="budgets-list"></div>
-</div>
-
-<div id="view-goals" style="display:none">
-  <div class="card" id="goals-list"></div>
+<div class="modal" id="tx-modal">
+  <div class="sheet">
+    <div class="section-title" id="form-title">Add</div>
+    <label id="lbl-form-amount">Amount</label>
+    <input id="f-amount" inputmode="decimal">
+    <label id="lbl-form-type">Type</label>
+    <select id="f-type"></select>
+    <label id="lbl-form-category">Category</label>
+    <select id="f-category"></select>
+    <label id="lbl-form-date">Date</label>
+    <input id="f-date" type="date">
+    <label id="lbl-form-desc">Description</label>
+    <input id="f-description">
+    <label id="lbl-form-store">Store</label>
+    <input id="f-store">
+    <label id="lbl-form-pay">Payment</label>
+    <select id="f-payment"></select>
+    <div class="actions">
+      <button type="button" id="form-cancel">Cancel</button>
+      <button type="button" class="primary" id="form-save">Save</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -116,12 +159,21 @@ const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 const initData = tg?.initData || "";
 
+let I18N = {};
+let me = { categories: [], payments: [], today: "" };
 let currentTab = "overview";
 let currentPeriod = "month";
+let customFrom = "";
+let customTo = "";
 let currentCategory = "all";
 let chart = null;
 let txOffset = 0;
+let editingId = null;
 const TX_PAGE = 50;
+
+function tr(key, fallback) {
+  return I18N[key] || fallback || key;
+}
 
 function setText(id, value) {
   document.getElementById(id).textContent = value == null ? "" : String(value);
@@ -135,34 +187,98 @@ function setEmpty(el, text) {
   el.appendChild(empty);
 }
 
-async function api(path) {
-  const res = await fetch(path, { headers: { "X-Telegram-Init-Data": initData } });
+function periodQuery() {
+  if (currentPeriod === "custom" && customFrom && customTo) {
+    return `date_from=${encodeURIComponent(customFrom)}&date_to=${encodeURIComponent(customTo)}`;
+  }
+  return `period=${encodeURIComponent(currentPeriod)}`;
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    ...options,
+    headers: {
+      "X-Telegram-Init-Data": initData,
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers || {}),
+    },
+  });
   if (!res.ok) throw new Error("API error " + res.status);
   return res.json();
 }
 
-async function loadCategoryFilter() {
-  const data = await api("/api/category_list");
-  const select = document.getElementById("category-filter");
+function applyI18n() {
+  setText("app-title", tr("app_title"));
+  setText("tab-overview", tr("tab_overview"));
+  setText("tab-budgets", tr("tab_budgets"));
+  setText("tab-goals", tr("tab_goals"));
+  setText("p-week", tr("period_week"));
+  setText("p-month", tr("period_month"));
+  setText("p-3months", tr("period_3months"));
+  setText("p-year", tr("period_year"));
+  setText("p-custom", tr("period_custom"));
+  setText("custom-apply", tr("custom_apply"));
+  setText("lbl-expense", tr("expenses"));
+  setText("lbl-income", tr("income"));
+  setText("lbl-balance", tr("balance"));
+  setText("lbl-by-cat", tr("by_categories"));
+  setText("lbl-tx", tr("transactions_title"));
+  setText("tx-prev", tr("back_button"));
+  setText("tx-next", tr("more_button"));
+  setText("lbl-form-amount", tr("form_amount"));
+  setText("lbl-form-type", tr("form_type"));
+  setText("lbl-form-category", tr("form_category"));
+  setText("lbl-form-date", tr("form_date"));
+  setText("lbl-form-desc", tr("form_description"));
+  setText("lbl-form-store", tr("form_store"));
+  setText("lbl-form-pay", tr("form_payment"));
+  setText("form-cancel", tr("cancel_button"));
+  setText("form-save", tr("save_button"));
+  document.getElementById("fab-add").setAttribute("aria-label", tr("add_button"));
+}
+
+function fillSelect(select, items, emptyValue, emptyLabel) {
   select.replaceChildren();
-  const all = document.createElement("option");
-  all.value = "all";
-  all.textContent = "Все категории";
-  select.appendChild(all);
-  (data.items || []).forEach(c => {
+  if (emptyValue != null) {
     const opt = document.createElement("option");
-    opt.value = encodeURIComponent(c.name);
-    opt.textContent = `${c.emoji || ""} ${c.name || ""}`.trim();
+    opt.value = emptyValue;
+    opt.textContent = emptyLabel;
+    select.appendChild(opt);
+  }
+  items.forEach((item) => {
+    const opt = document.createElement("option");
+    opt.value = String(item.id ?? item.name);
+    opt.textContent = `${item.emoji || ""} ${item.name}`.trim();
     select.appendChild(opt);
   });
 }
 
+function applyCatalog() {
+  fillSelect(
+    document.getElementById("category-filter"),
+    me.categories.map((c) => ({ id: c.name, name: c.name, emoji: c.emoji })),
+    "all",
+    tr("all_categories"),
+  );
+  fillSelect(document.getElementById("f-category"), me.categories);
+  fillSelect(document.getElementById("f-payment"), me.payments, "", "—");
+  const typeSelect = document.getElementById("f-type");
+  typeSelect.replaceChildren();
+  [["expense", tr("type_expense")], ["income", tr("type_income")]].forEach(([value, label]) => {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = label;
+    typeSelect.appendChild(opt);
+  });
+}
+
 async function loadOverview() {
-  const catParam = currentCategory !== "all" ? `&category=${currentCategory}` : "";
+  const catParam = currentCategory !== "all" ? `&category=${encodeURIComponent(currentCategory)}` : "";
+  const query = periodQuery();
   const [summary, categories, transactions] = await Promise.all([
-    api(`/api/summary?period=${currentPeriod}`),
-    api(`/api/categories?period=${currentPeriod}`),
-    api(`/api/transactions?period=${currentPeriod}${catParam}&limit=${TX_PAGE}&offset=${txOffset}`),
+    api(`/api/summary?${query}`),
+    api(`/api/categories?${query}`),
+    api(`/api/transactions?${query}${catParam}&limit=${TX_PAGE}&offset=${txOffset}`),
   ]);
 
   setText("expense-value", summary.expense_formatted);
@@ -187,24 +303,26 @@ async function loadOverview() {
 
   const listEl = document.getElementById("transactions-list");
   if (transactions.items.length === 0) {
-    setEmpty(listEl, "Операций не найдено");
+    setEmpty(listEl, tr("no_transactions"));
   } else {
     listEl.replaceChildren();
-    transactions.items.forEach(t => {
-      const item = document.createElement("div");
-      item.className = "list-item";
+    transactions.items.forEach((item) => {
+      const button = document.createElement("button");
+      button.className = "list-item";
+      button.type = "button";
       const left = document.createElement("div");
       left.className = "left";
       const title = document.createElement("span");
-      title.textContent = t.description || t.store || "без описания";
+      title.textContent = item.description || item.store || tr("no_description");
       const cat = document.createElement("span");
       cat.className = "cat";
-      cat.textContent = `${t.date} · ${t.category_emoji || "🏷"} ${t.category || "—"}`;
+      cat.textContent = `${item.date_formatted || item.date} · ${item.category_emoji || "🏷"} ${item.category || "—"}`;
       left.append(title, cat);
       const amount = document.createElement("span");
-      amount.textContent = `${t.type === "income" ? "+" : "-"}${t.amount_formatted}`;
-      item.append(left, amount);
-      listEl.appendChild(item);
+      amount.textContent = `${item.type === "income" ? "+" : "-"}${item.amount_formatted}`;
+      button.append(left, amount);
+      button.addEventListener("click", () => openForm(item));
+      listEl.appendChild(button);
     });
   }
   const pager = document.getElementById("tx-pager");
@@ -218,17 +336,18 @@ async function loadBudgets() {
   const data = await api("/api/budgets");
   const el = document.getElementById("budgets-list");
   if (data.items.length === 0) {
-    setEmpty(el, "Лимиты не заданы");
+    setEmpty(el, tr("no_budgets"));
     return;
   }
   el.replaceChildren();
-  data.items.forEach(b => {
+  data.items.forEach((b) => {
     const wrap = document.createElement("div");
     wrap.style.marginBottom = "14px";
     const row = document.createElement("div");
     row.className = "list-item";
     row.style.border = "none";
     row.style.padding = "2px 0";
+    row.style.cursor = "default";
     const name = document.createElement("span");
     name.textContent = b.category;
     const nums = document.createElement("span");
@@ -251,17 +370,18 @@ async function loadGoals() {
   const data = await api("/api/goals");
   const el = document.getElementById("goals-list");
   if (data.items.length === 0) {
-    setEmpty(el, "Целей пока нет");
+    setEmpty(el, tr("no_goals"));
     return;
   }
   el.replaceChildren();
-  data.items.forEach(g => {
+  data.items.forEach((g) => {
     const wrap = document.createElement("div");
     wrap.style.marginBottom = "14px";
     const row = document.createElement("div");
     row.className = "list-item";
     row.style.border = "none";
     row.style.padding = "2px 0";
+    row.style.cursor = "default";
     const name = document.createElement("span");
     name.textContent = g.name;
     const nums = document.createElement("span");
@@ -290,19 +410,63 @@ async function refresh() {
   } catch (e) {
     console.error(e);
     err.style.display = "block";
-    err.textContent = "Не удалось загрузить данные. Открой Mini App из бота после /start.";
+    err.textContent = tr("load_error");
   }
 }
 
-document.querySelectorAll(".tabs")[0].addEventListener("click", (e) => {
+function openForm(item) {
+  editingId = item ? item.id : null;
+  setText("form-title", item ? tr("edit_button") : tr("add_button"));
+  document.getElementById("f-amount").value = item ? (Number(item.amount) / 100).toString() : "";
+  document.getElementById("f-type").value = item && item.type === "income" ? "income" : "expense";
+  document.getElementById("f-category").value = item && item.category_id ? String(item.category_id) : (me.categories[0] ? String(me.categories[0].id) : "");
+  document.getElementById("f-date").value = item ? item.date : (me.today || "");
+  document.getElementById("f-description").value = item && item.description ? item.description : "";
+  document.getElementById("f-store").value = item && item.store ? item.store : "";
+  document.getElementById("f-payment").value = item && item.payment_method_id ? String(item.payment_method_id) : "";
+  document.getElementById("tx-modal").classList.add("open");
+}
+
+function closeForm() {
+  document.getElementById("tx-modal").classList.remove("open");
+  editingId = null;
+}
+
+async function saveForm() {
+  const payload = {
+    amount: document.getElementById("f-amount").value,
+    type: document.getElementById("f-type").value,
+    category_id: Number(document.getElementById("f-category").value),
+    date: document.getElementById("f-date").value,
+    description: document.getElementById("f-description").value,
+    store: document.getElementById("f-store").value,
+    payment_method_id: document.getElementById("f-payment").value || null,
+  };
+  try {
+    if (editingId) {
+      await api(`/api/transactions/${editingId}`, { method: "PATCH", body: JSON.stringify(payload) });
+    } else {
+      await api("/api/transactions", { method: "POST", body: JSON.stringify(payload) });
+    }
+    closeForm();
+    txOffset = 0;
+    await refresh();
+  } catch (e) {
+    document.getElementById("app-error").style.display = "block";
+    document.getElementById("app-error").textContent = tr("save_error");
+  }
+}
+
+document.getElementById("main-tabs").addEventListener("click", (e) => {
   const btn = e.target.closest(".tab");
   if (!btn) return;
-  document.querySelectorAll(".tabs")[0].querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
+  document.getElementById("main-tabs").querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
   btn.classList.add("active");
   currentTab = btn.dataset.tab;
-  ["overview","budgets","goals"].forEach(t => {
-    document.getElementById("view-" + t).style.display = (t === currentTab) ? "block" : "none";
+  ["overview","budgets","goals"].forEach(name => {
+    document.getElementById("view-" + name).style.display = (name === currentTab) ? "block" : "none";
   });
+  document.getElementById("fab-add").style.display = currentTab === "overview" ? "block" : "none";
   refresh();
 });
 
@@ -312,6 +476,14 @@ document.getElementById("period-tabs").addEventListener("click", (e) => {
   document.getElementById("period-tabs").querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
   btn.classList.add("active");
   currentPeriod = btn.dataset.period;
+  document.getElementById("custom-dates").classList.toggle("open", currentPeriod === "custom");
+  txOffset = 0;
+  if (currentPeriod !== "custom") refresh();
+});
+
+document.getElementById("custom-apply").addEventListener("click", () => {
+  customFrom = document.getElementById("date-from").value;
+  customTo = document.getElementById("date-to").value;
   txOffset = 0;
   refresh();
 });
@@ -330,9 +502,24 @@ document.getElementById("tx-next").addEventListener("click", () => {
   txOffset += TX_PAGE;
   refresh();
 });
+document.getElementById("fab-add").addEventListener("click", () => openForm(null));
+document.getElementById("form-cancel").addEventListener("click", closeForm);
+document.getElementById("form-save").addEventListener("click", saveForm);
 
-loadCategoryFilter();
-refresh();
+(async function init() {
+  try {
+    me = await api("/api/me");
+    I18N = me.translations || {};
+    applyI18n();
+    applyCatalog();
+    document.getElementById("date-from").value = me.today || "";
+    document.getElementById("date-to").value = me.today || "";
+    await refresh();
+  } catch (e) {
+    document.getElementById("app-error").style.display = "block";
+    document.getElementById("app-error").textContent = "Open Mini App from the bot after /start.";
+  }
+})();
 </script>
 </body>
 </html>

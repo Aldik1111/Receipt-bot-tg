@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config import DB_PATH  # noqa: E402
+from config import BACKUP_DIR, BACKUP_RETAIN_DAYS, DB_PATH  # noqa: E402
 
 
 INTERESTING_TABLES = (
@@ -84,6 +84,58 @@ def copy_database(src: Path, dest: Path) -> None:
         source.close()
 
 
+def backups_dir() -> Path:
+    path = Path(BACKUP_DIR)
+    if not path.is_absolute():
+        path = ROOT / path
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def prune_old_backups(directory: Path | None = None, retain_days: int = BACKUP_RETAIN_DAYS) -> int:
+    folder = directory or backups_dir()
+    cutoff = datetime.now().timestamp() - retain_days * 86400
+    removed = 0
+    for path in folder.glob("budget-*.db"):
+        if path.stat().st_mtime < cutoff:
+            path.unlink()
+            removed += 1
+    return removed
+
+
+def create_timestamped_backup() -> Path | None:
+    src = Path(DB_PATH)
+    if not src.is_absolute():
+        src = ROOT / src
+    if not src.exists():
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = backups_dir() / f"budget-{stamp}.db"
+    copy_database(src, dest)
+    verify_copy(src, dest)
+    prune_old_backups()
+    return dest
+
+
+def restore_check(backup_path: Path, dest: Path) -> None:
+    """Копирует снимок в отдельный файл и сверяет его с самим собой, не с live DB."""
+    if dest.exists():
+        dest.unlink()
+    copy_database(backup_path, dest)
+    dest_check = integrity_ok(dest)
+    if dest_check != "ok":
+        raise SystemExit(f"Restored copy failed integrity_check: {dest_check}")
+    src_counts = table_counts(backup_path)
+    dest_counts = table_counts(dest)
+    if src_counts != dest_counts:
+        raise SystemExit(
+            f"Row counts differ.\n  backup: {src_counts}\n  restored: {dest_counts}"
+        )
+    print(f"integrity restored={dest_check}")
+    for table, count in src_counts.items():
+        print(f"  {table}: {count}")
+
+
 def verify_copy(src: Path, dest: Path) -> None:
     src_check = integrity_ok(src)
     dest_check = integrity_ok(dest)
@@ -104,9 +156,21 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--restore-check",
-        help="Verify an existing backup file against a fresh temp copy of the live DB",
+        help="Copy a backup into a separate file and verify integrity/row counts",
     )
     args = parser.parse_args()
+
+    if args.restore_check:
+        backup_path = Path(args.restore_check)
+        if not backup_path.is_absolute():
+            backup_path = ROOT / backup_path
+        if not backup_path.exists():
+            print(f"Backup not found: {backup_path}")
+            return 1
+        test_path = backups_dir() / "restore-check.db"
+        restore_check(backup_path, test_path)
+        print(f"Restore check OK: {backup_path} -> {test_path}")
+        return 0
 
     src = Path(DB_PATH)
     if not src.is_absolute():
@@ -115,23 +179,10 @@ def main() -> int:
         print(f"No live database at {src}. Nothing to back up.")
         return 0
 
-    if args.restore_check:
-        backup_path = Path(args.restore_check)
-        if not backup_path.is_absolute():
-            backup_path = ROOT / backup_path
-        test_path = ROOT / "backups" / "restore-check.db"
-        if test_path.exists():
-            test_path.unlink()
-        # Restore the backup into a separate file, then compare it with live.
-        copy_database(backup_path, test_path)
-        verify_copy(src, test_path)
-        print(f"Restore check OK: {backup_path} -> {test_path}")
+    dest = create_timestamped_backup()
+    if dest is None:
+        print(f"No live database at {src}. Nothing to back up.")
         return 0
-
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    dest = ROOT / "backups" / f"budget-{stamp}.db"
-    copy_database(src, dest)
-    verify_copy(src, dest)
     print(f"Backup written to {dest}")
     return 0
 

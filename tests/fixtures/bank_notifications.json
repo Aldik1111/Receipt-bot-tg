@@ -1,0 +1,32 @@
+[
+  {
+    "text": "Kaspi Gold\nПокупка: 2 450,50 ₸\nМагазин: MAGNUM",
+    "amount": 245050,
+    "type": "expense",
+    "store": "MAGNUM"
+  },
+  {
+    "text": "Halyk\nЗачисление 150 000 KZT\nОстаток 200 000 KZT",
+    "amount": 15000000,
+    "type": "income",
+    "store": null
+  },
+  {
+    "text": "Оплата картой 780 KZT at COFFEE BOOM",
+    "amount": 78000,
+    "type": "expense",
+    "store": "COFFEE BOOM"
+  },
+  {
+    "text": "Kaspi.kz\nПеревод отправлен 3 200 ₸\nМагазин: SMALL MART",
+    "amount": 320000,
+    "type": "expense",
+    "store": "SMALL MART"
+  },
+  {
+    "text": "Halyk Bank\nПокупка: 1 090 KZT\nв SMALL",
+    "amount": 109000,
+    "type": "expense",
+    "store": "SMALL"
+  }
+]

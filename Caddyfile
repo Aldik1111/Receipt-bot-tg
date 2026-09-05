@@ -1,0 +1,22 @@
+{$DOMAIN:localhost} {
+	encode gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy same-origin
+		-Server
+	}
+
+	handle /health {
+		reverse_proxy webapp:8000
+	}
+
+	handle /api/* {
+		reverse_proxy webapp:8000
+	}
+
+	handle {
+		root * /srv/webapp
+		try_files {path} /index.html
+		file_server
+	}
+}
