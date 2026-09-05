@@ -281,11 +281,20 @@ class ImportExportTests(unittest.TestCase):
         self.assertEqual(_month_start(date(2026, 1, 15), months_back=2), date(2025, 11, 1))
 
 
+class ConfigEnvTests(unittest.TestCase):
+    def test_env_strips_inline_comment_and_quotes(self):
+        from config import _env
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ' "abc123" # comment '}, clear=False):
+            self.assertEqual(_env("GEMINI_API_KEY"), "abc123")
+
+
 class GeminiParseTests(unittest.TestCase):
     def test_comma_price_does_not_drop_other_items(self):
         from gemini_engine import _parse_item_price
 
         self.assertEqual(_parse_item_price("123,45"), 12345)
+        self.assertEqual(_parse_item_price("450 ₸"), 45000)
         self.assertEqual(_parse_item_price(10), 1000)
         self.assertIsNone(_parse_item_price("abc"))
         self.assertIsNone(_parse_item_price(float("nan")))
@@ -310,6 +319,26 @@ class GeminiParseTests(unittest.TestCase):
         self.assertEqual(parsed["total"], 1250)
         self.assertIsNone(parsed["date"])
         self.assertEqual(len(parsed["store"]), 120)
+
+    def test_candidate_text_skips_gemini3_thoughts(self):
+        from gemini_engine import _candidate_text, _loads_model_json
+
+        payload = {
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thought": True, "text": "сначала подумаю"},
+                        {
+                            "thoughtSignature": "opaque",
+                            "text": '```json\n{"items":[{"name":"хлеб","price":100}]}\n```',
+                        },
+                    ]
+                }
+            }]
+        }
+        text = _candidate_text(payload)
+        data = _loads_model_json(text)
+        self.assertEqual(data["items"][0]["name"], "хлеб")
 
     def test_mime_from_magic_bytes(self):
         from gemini_engine import _guess_mime_type

@@ -22,7 +22,17 @@ from money import MoneyError, tenge_to_tiyn
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 30  # секунд - vision-запросы медленнее обычных текстовых
+REQUEST_TIMEOUT = 60  # Gemini 3 сначала «думает», 30с часто рвёт vision-запрос
+# Если алиас 404 — пробуем актуальные Flash-модели по очереди.
+GEMINI_MODEL_FALLBACKS = (
+    GEMINI_MODEL,
+    "gemini-flash-latest",
+    "gemini-3.6-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+)
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+_CURRENCY_TAIL_RE = re.compile(r"(₸|тг\.?|тенге|kzt|tg)\s*$", re.IGNORECASE)
 
 PROMPT = """Ты распознаёшь кассовый чек на фото. Верни ТОЛЬКО JSON без пояснений, строго в такой структуре:
 
@@ -64,10 +74,64 @@ def _parse_item_price(value) -> int | None:
     """Цена из JSON Gemini — тенге; возвращаем целые тиыны."""
     if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, str):
+        value = _CURRENCY_TAIL_RE.sub("", value.strip())
     try:
         return tenge_to_tiyn(value)
     except MoneyError:
         return None
+
+
+def _candidate_text(payload: dict) -> str | None:
+    """Собирает видимый текст, пропуская thought-части Gemini 3."""
+    if not isinstance(payload, dict):
+        return None
+    feedback = payload.get("promptFeedback") or payload.get("prompt_feedback") or {}
+    if feedback.get("blockReason") or feedback.get("block_reason"):
+        logger.error("Gemini заблокировал запрос: %s", feedback)
+        return None
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        logger.error("Gemini вернул пустой candidates: %s", str(payload)[:400])
+        return None
+    content = candidates[0].get("content") or {}
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        logger.error(
+            "Gemini без parts, finishReason=%s",
+            candidates[0].get("finishReason") or candidates[0].get("finish_reason"),
+        )
+        return None
+    chunks: list[str] = []
+    thoughts: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        if not text:
+            continue
+        # thoughtSignature живёт на финальном ответе, не на «думании».
+        if part.get("thought") is True:
+            thoughts.append(str(text))
+            continue
+        chunks.append(str(text))
+    if chunks:
+        return "".join(chunks).strip()
+    if thoughts:
+        return thoughts[-1].strip()
+    return None
+
+
+def _loads_model_json(text: str):
+    raw = _JSON_FENCE_RE.sub("", (text or "").strip())
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(raw[start : end + 1])
+        raise
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -139,34 +203,70 @@ def sanitize_gemini_receipt(data: dict) -> dict | None:
     }
 
 
+def _gemini_models() -> list[str]:
+    seen: list[str] = []
+    for name in GEMINI_MODEL_FALLBACKS:
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
 def _post_gemini(body: dict) -> tuple[dict | None, str | None]:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY,
     }
     last_error = None
-    for attempt in range(3):
-        try:
-            response = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-            if response.status_code == 429:
-                last_error = "rate_limit"
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            if response.status_code in (500, 502, 503, 504):
+    models = _gemini_models()
+    for model in models:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
+        )
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    url, headers=headers, json=body, timeout=REQUEST_TIMEOUT
+                )
+                if response.status_code == 429:
+                    last_error = "rate_limit"
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                if response.status_code in (500, 502, 503, 504):
+                    last_error = "network"
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                if response.status_code == 404:
+                    logger.warning("Gemini модель %s не найдена, пробую следующую", model)
+                    last_error = "unavailable"
+                    break
+                if not response.ok:
+                    logger.error(
+                        "Gemini API %s вернул %s: %s",
+                        model,
+                        response.status_code,
+                        response.text[:500],
+                    )
+                    if (
+                        response.status_code == 400
+                        and isinstance(body.get("generationConfig"), dict)
+                        and "thinkingConfig" in body["generationConfig"]
+                    ):
+                        body = dict(body)
+                        gen = dict(body["generationConfig"])
+                        gen.pop("thinkingConfig", None)
+                        body["generationConfig"] = gen
+                        last_error = "unavailable"
+                        continue
+                    if response.status_code in (400, 403) and model != models[-1]:
+                        last_error = "unavailable"
+                        break
+                    return None, "unavailable"
+                return response.json(), None
+            except requests.RequestException:
+                logger.exception("Сеть Gemini, модель %s попытка %s", model, attempt + 1)
                 last_error = "network"
                 time.sleep(1.5 * (attempt + 1))
-                continue
-            if not response.ok:
-                logger.error(
-                    "Gemini API вернул %s: %s", response.status_code, response.text[:500]
-                )
-                return None, "unavailable"
-            return response.json(), None
-        except requests.RequestException:
-            logger.exception("Сеть Gemini, попытка %s", attempt + 1)
-            last_error = "network"
-            time.sleep(1.5 * (attempt + 1))
     if last_error:
         logger.error("Gemini недоступен после повторов, причина %s", last_error)
         return None, last_error
@@ -186,13 +286,20 @@ def get_receipt_from_gemini(image_path: str) -> tuple[dict | None, str | None]:
             {
                 "parts": [
                     {"text": PROMPT},
-                    {"inline_data": {"mime_type": _guess_mime_type(image_path), "data": image_b64}},
+                    {
+                        "inline_data": {
+                            "mime_type": _guess_mime_type(image_path),
+                            "data": image_b64,
+                        }
+                    },
                 ]
             }
         ],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "temperature": 0.1,
+            "maxOutputTokens": 8192,
+            # MINIMAL thinkingLevel на flash-latest даёт 400; budget=0 проходит.
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
 
@@ -202,8 +309,10 @@ def get_receipt_from_gemini(image_path: str) -> tuple[dict | None, str | None]:
     if not payload:
         return None, "unavailable"
     try:
-        text = payload["candidates"][0]["content"]["parts"][0]["text"]
-        data = json.loads(text)
+        text = _candidate_text(payload)
+        if not text:
+            return None, "bad_json"
+        data = _loads_model_json(text)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError):
         logger.exception("Некорректный ответ Gemini")
         return None, "bad_json"
@@ -224,10 +333,7 @@ def _text_request(prompt: str, max_tokens: int = 200) -> str | None:
     payload, err = _post_gemini(body)
     if err or not payload:
         return None
-    try:
-        return payload["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except (KeyError, IndexError, TypeError):
-        return None
+    return _candidate_text(payload)
 
 
 def guess_categories_ai(item_names: list[str], category_names: list[str]) -> dict[str, str]:
@@ -245,7 +351,7 @@ def guess_categories_ai(item_names: list[str], category_names: list[str]) -> dic
     if not result:
         return {}
     try:
-        data = json.loads(result)
+        data = _loads_model_json(result)
     except json.JSONDecodeError:
         return {}
     if not isinstance(data, dict):

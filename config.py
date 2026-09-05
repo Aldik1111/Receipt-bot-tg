@@ -6,8 +6,22 @@ try:
 except ImportError:
     pass  # python-dotenv не обязателен - можно просто экспортировать переменные в shell
 
+
+def _env(name: str, default: str = "") -> str:
+    """Читает .env без кавычек и хвоста вида ` # комментарий`."""
+    raw = os.getenv(name, default)
+    if raw is None:
+        raw = default
+    text = str(raw).strip()
+    if " #" in text:
+        text = text.split(" #", 1)[0].rstrip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text
+
+
 # Токен бота берём из переменной окружения (получить у @BotFather в Telegram)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = _env("BOT_TOKEN")
 
 # Публичный HTTPS-адрес Mini App (без завершающего слэша).
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")
@@ -82,12 +96,12 @@ DEFAULT_PAYMENT_METHODS = ["Наличные", "Карта (основная)"]
 CURRENCY_SYMBOL = "₸"
 
 # Google Gemini - единственный способ распознавания чека.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY = _env("GEMINI_API_KEY")
 # Название модели-алиаса - Google сам направляет его на актуальную Flash-модель,
 # поэтому имя не "протухнет" при выходе новых версий (в отличие от жёстко
 # зашитого "gemini-2.5-flash", который в какой-то момент может быть снят с
 # поддержки). Полный список: https://ai.google.dev/gemini-api/docs/models
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-flash-latest")
 
 # Твой Telegram user_id - сюда будет приходить фидбэк от /feedback.
 # Узнать свой id можно у бота @userinfobot.
