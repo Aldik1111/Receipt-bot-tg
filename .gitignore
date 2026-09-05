@@ -10,6 +10,9 @@
 *.sqlite
 *.sqlite3
 
+# Local copies of the live database. They contain real user data.
+backups/
+
 # Python
 __pycache__/
 *.py[cod]

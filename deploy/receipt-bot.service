@@ -1,0 +1,20 @@
+[Unit]
+Description=Receipt Telegram bot
+After=network.target
+
+[Service]
+Type=simple
+User=app
+Group=app
+WorkingDirectory=/opt/receipt_tg_bot
+EnvironmentFile=/opt/receipt_tg_bot/.env
+Environment=LOG_FORMAT=json
+Environment=LOG_FILE=/var/log/receipt-bot/bot.log
+ExecStart=/opt/receipt_tg_bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Receipt Mini App API
+After=network.target
+
+[Service]
+Type=simple
+User=app
+Group=app
+WorkingDirectory=/opt/receipt_tg_bot
+EnvironmentFile=/opt/receipt_tg_bot/.env
+Environment=WEBAPP_HOST=127.0.0.1
+Environment=WEBAPP_PORT=8000
+Environment=LOG_FORMAT=json
+Environment=LOG_FILE=/var/log/receipt-bot/webapp.log
+ExecStart=/opt/receipt_tg_bot/.venv/bin/python webapp_api.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

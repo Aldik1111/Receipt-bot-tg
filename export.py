@@ -3,8 +3,11 @@
 import csv
 import io
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
+from money import signed_tenge_to_tiyn, tenge_export_value
+
+TYPE_LABELS = {"income": "Доход", "expense": "Расход", "transfer": "Перевод"}
 HEADERS = ["Дата", "Время", "Тип", "Сумма", "Категория", "Способ оплаты", "Магазин", "Описание"]
 MAX_IMPORT_ROWS = 5000
 
@@ -13,8 +16,8 @@ def _row_values(r: dict) -> list:
     return [
         r["op_date"],
         r["op_time"] or "",
-        "Доход" if r["type"] == "income" else "Расход",
-        r["amount"],
+        TYPE_LABELS.get(r["type"], "Расход"),
+        tenge_export_value(r["amount"]),
         r["category_name"] or "",
         r["payment_name"] or "",
         r["store"] or "",
@@ -54,29 +57,76 @@ def export_xlsx(rows: list[dict]) -> io.BytesIO:
 # Импорт: разбор чужого CSV/Excel (выписка из банка или другого приложения)
 # ---------------------------------------------------------------------------
 
-import re as _re
-
-from openpyxl import load_workbook
-
 # Возможные названия колонок в выписках - ищем без учёта регистра/пробелов
 DATE_HEADERS = {"дата", "date", "operation date", "дата операции"}
 AMOUNT_HEADERS = {"сумма", "amount", "sum", "sum, kzt", "сумма, kzt"}
 DESC_HEADERS = {"описание", "назначение", "description", "detail", "merchant", "получатель"}
+TYPE_HEADERS = {"тип", "type", "тип операции", "направление", "операция"}
+CATEGORY_HEADERS = {"категория", "category"}
+PAYMENT_HEADERS = {"способ оплаты", "оплата", "payment", "payment method", "счёт", "счет", "карта"}
+STORE_HEADERS = {"магазин", "store", "место", "продавец"}
+
+# Значения колонки "Тип". Своя выгрузка пишет "Доход"/"Расход", у банков и
+# других приложений встречаются английские и «списание/зачисление».
+INCOME_WORDS = {"доход", "income", "credit", "зачисление", "пополнение", "приход", "+"}
+EXPENSE_WORDS = {"расход", "expense", "debit", "списание", "покупка", "оплата", "-"}
+TRANSFER_WORDS = {"перевод", "transfer", "накопление"}
+
+# Порядок важен: сначала более узкие наборы, иначе "оплата" из PAYMENT_HEADERS
+# перехватит колонку "Способ оплаты" раньше, чем сработает STORE/TYPE.
+_HEADER_GROUPS = (
+    ("date", DATE_HEADERS),
+    ("amount", AMOUNT_HEADERS),
+    ("type", TYPE_HEADERS),
+    ("category", CATEGORY_HEADERS),
+    ("payment", PAYMENT_HEADERS),
+    ("store", STORE_HEADERS),
+    ("description", DESC_HEADERS),
+)
 
 
 def _guess_columns(header_row: list) -> dict[str, int]:
-    mapping = {}
+    mapping: dict[str, int] = {}
     for idx, cell in enumerate(header_row):
         if cell is None:
             continue
         norm = str(cell).strip().lower()
-        if norm in DATE_HEADERS and "date" not in mapping:
-            mapping["date"] = idx
-        elif norm in AMOUNT_HEADERS and "amount" not in mapping:
-            mapping["amount"] = idx
-        elif norm in DESC_HEADERS and "description" not in mapping:
-            mapping["description"] = idx
+        for key, headers in _HEADER_GROUPS:
+            if norm in headers and key not in mapping:
+                mapping[key] = idx
+                break
     return mapping
+
+
+def _parse_type_cell(value) -> str | None:
+    """expense/income/transfer, если колонка типа заполнена понятным словом, иначе None."""
+    if value is None:
+        return None
+    norm = str(value).strip().lower()
+    if not norm:
+        return None
+    if norm in INCOME_WORDS:
+        return "income"
+    if norm in EXPENSE_WORDS:
+        return "expense"
+    if norm in TRANSFER_WORDS:
+        return "transfer"
+    return None
+
+
+def _cell(row: list, mapping: dict[str, int], key: str):
+    idx = mapping.get(key)
+    if idx is None or idx >= len(row):
+        return None
+    return row[idx]
+
+
+def _text_cell(row: list, mapping: dict[str, int], key: str) -> str | None:
+    value = _cell(row, mapping, key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:200] or None
 
 
 def _parse_date_cell(value) -> str | None:
@@ -137,32 +187,41 @@ def parse_import_file(file_bytes: bytes, filename: str) -> list[dict]:
         return []  # без колонки суммы разбирать нечего
 
     results = []
+    # Строки, где тип пришлось выводить из знака суммы. Только к ним применима
+    # эвристика «в файле нет минусов - значит это всё траты»: если в файле есть
+    # явная колонка типа, её значения важнее любых догадок по знаку.
+    guessed_indexes: list[int] = []
+
     for row in rows_raw[1:]:
-        if mapping["amount"] >= len(row):
-            continue
-        amount_raw = row[mapping["amount"]]
+        amount_raw = _cell(row, mapping, "amount")
         if amount_raw is None or str(amount_raw).strip() == "":
             continue
-        try:
-            amount = float(str(amount_raw).replace(" ", "").replace(",", "."))
-        except ValueError:
+        parsed = signed_tenge_to_tiyn(amount_raw)
+        if parsed is None:
             continue
+        amount, sign = parsed
 
-        date_val = row[mapping["date"]] if "date" in mapping and mapping["date"] < len(row) else None
-        desc_val = row[mapping["description"]] if "description" in mapping and mapping["description"] < len(row) else None
+        tx_type = _parse_type_cell(_cell(row, mapping, "type"))
+        if tx_type is None:
+            tx_type = "expense" if sign < 0 else "income"
+            guessed_indexes.append(len(results))
 
         results.append({
-            "amount": abs(amount),
-            "type": "expense" if amount < 0 else "income",
-            "date": _parse_date_cell(date_val),
-            "description": str(desc_val).strip() if desc_val else None,
+            "amount": amount,
+            "type": tx_type,
+            "date": _parse_date_cell(_cell(row, mapping, "date")),
+            "description": _text_cell(row, mapping, "description"),
+            "category": _text_cell(row, mapping, "category"),
+            "payment": _text_cell(row, mapping, "payment"),
+            "store": _text_cell(row, mapping, "store"),
         })
 
-    if results and not any(r["type"] == "expense" for r in results):
-        # Ни одной отрицательной суммы в файле - похоже, знак направления тут
-        # не используется. Безопаснее по умолчанию считать всё расходом
+    guessed = [results[i] for i in guessed_indexes]
+    if guessed and not any(r["type"] == "expense" for r in guessed):
+        # Ни одной отрицательной суммы среди строк без явного типа - похоже,
+        # знак направления тут не используется. Безопаснее считать их расходом
         # (это обычные траты), чем ошибочно записать все как доходы.
-        for r in results:
+        for r in guessed:
             r["type"] = "expense"
 
     return results

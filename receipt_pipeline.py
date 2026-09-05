@@ -2,8 +2,8 @@
 Главная точка входа для распознавания чека. Один шаг: Google Gemini -
 мультимодальная модель, которая по фото сразу возвращает магазин, дату,
 товары и цены в виде JSON. Если Gemini не смог распознать (не настроен
-ключ, ошибка сети, на фото нет чека и т.д.) - возвращается "пустой" чек,
-и bot.py предлагает добавить трату вручную.
+ключ, ошибка сети, на фото нет чека и т.д.) - возвращается "пустой" чек
+и код ошибки для понятного сообщения пользователю.
 """
 
 import logging
@@ -24,20 +24,27 @@ EMPTY_RECEIPT = {
 }
 
 
-def extract_receipt(image_path: str, user_id: int) -> dict:
+def extract_receipt(image_path: str, user_id: int) -> tuple[dict, str | None]:
     try:
-        result = get_receipt_from_gemini(image_path)
+        result, err = get_receipt_from_gemini(image_path)
     except Exception:
         logger.exception("Ошибка при распознавании чека через Gemini")
-        result = None
+        return dict(EMPTY_RECEIPT), "unavailable"
+
+    if err:
+        if err == "empty":
+            logger.info("Gemini не нашёл товары на чеке")
+        else:
+            logger.info("Gemini не смог распознать чек: %s", err)
+        return dict(EMPTY_RECEIPT), err
 
     if result and result.get("items"):
         logger.info("Чек распознан через Gemini")
         _categorize_items(result, user_id)
-        return result
+        return result, None
 
     logger.info("Gemini не смог распознать чек")
-    return dict(EMPTY_RECEIPT)
+    return dict(EMPTY_RECEIPT), "empty"
 
 
 def _categorize_items(parsed: dict, user_id: int) -> None:
