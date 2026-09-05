@@ -70,11 +70,32 @@ Google периодически меняет эти лимиты (в 2026 уже
 
 ### 1. Python-зависимости
 
+Нужен **Python 3.12**. Версия зафиксирована в `.python-version`, пакеты —
+точными пинами в `requirements.txt`.
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate       # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+После клонирования тесты запускаются без `.env` и без живой базы:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## Резервная копия живой базы
+
+Файл `budget.db` gitignored. Чтобы снять копию и проверить, что она
+открывается как отдельная база с теми же счётчиками:
+
+```bash
+python scripts/backup_sqlite.py
+python scripts/backup_sqlite.py --restore-check backups/budget-YYYYMMDD-HHMMSS.db
+```
+
+Каталог `backups/` тоже в `.gitignore` — туда попадают настоящие данные.
 
 ### 2. Токен бота
 
@@ -218,7 +239,6 @@ systemd-сервисом решит задачу так же надёжно.
 
 ## Возможные следующие шаги (когда захочешь развивать проект)
 
-- Редактирование позиций чека до сохранения (сейчас позиции правятся уже после записи).
 - Часовой пояс пользователя вместо времени сервера.
 - Покрытие хендлеров Telegram автотестами.
 
