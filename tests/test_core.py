@@ -365,6 +365,70 @@ class AtomicReceiptTests(unittest.TestCase):
         self.assertEqual(self._counts(), (0, 0))
         self.assertIsNotNone(db.load_state("receipt_draft", "draft"))
 
+    def test_receipt_draft_items_can_be_edited_and_deleted_only_by_owner(self):
+        db.save_state("receipt_draft", "draft", self._draft(), user_id=1)
+
+        self.assertIsNone(
+            db.update_receipt_draft_item(2, "draft", 0, "Чужая правка", 1)
+        )
+        parsed = db.update_receipt_draft_item(1, "draft", 0, "Молоко", 450.5)
+        self.assertEqual(parsed["items"][0]["name"], "Молоко")
+        self.assertEqual(parsed["items"][0]["price"], 450.5)
+
+        parsed = db.delete_receipt_draft_item(1, "draft", 1)
+        self.assertEqual(len(parsed["items"]), 1)
+        with self.assertRaises(ValueError):
+            db.delete_receipt_draft_item(1, "draft", 0)
+        self.assertEqual(len(db.get_receipt_draft(1, "draft")["items"]), 1)
+        self.assertIsNone(db.get_receipt_draft(2, "draft"))
+
+    def test_receipt_total_mismatch_requires_choice_and_resolves_exactly(self):
+        draft = self._draft()
+        draft["total"] = 250
+        db.save_state("receipt_draft", "items", draft, user_id=1)
+        with self.assertRaises(ValueError):
+            db.save_receipt_draft(1, "items", "2026-08-20")
+        self.assertEqual(self._counts(), (0, 0))
+        self.assertIsNotNone(db.get_receipt_draft(1, "items"))
+
+        parsed = db.resolve_receipt_draft_total(1, "items", use_receipt_total=False)
+        self.assertEqual(parsed["total"], 300)
+        receipt_id, _ = db.save_receipt_draft(1, "items", "2026-08-20")
+        self.assertIsInstance(receipt_id, int)
+
+        draft = self._draft()
+        draft["total"] = 250
+        db.save_state("receipt_draft", "receipt", draft, user_id=1)
+        parsed = db.resolve_receipt_draft_total(1, "receipt", use_receipt_total=True)
+        self.assertEqual(round(sum(item["price"] for item in parsed["items"]), 2), 250)
+        self.assertTrue(all(item["price"] > 0 for item in parsed["items"]))
+        db.save_receipt_draft(1, "receipt", "2026-08-20")
+        with db.get_conn() as conn:
+            stored_total = conn.execute(
+                """SELECT SUM(t.amount) FROM transactions t
+                   JOIN receipts r ON r.id=t.receipt_id
+                   WHERE r.user_id=1 AND r.id=(
+                       SELECT MAX(id) FROM receipts WHERE user_id=1
+                   )"""
+            ).fetchone()[0]
+        self.assertEqual(stored_total, 250)
+
+    def test_receipt_preview_blocks_save_until_total_is_resolved(self):
+        draft = self._draft()
+        draft["total"] = 250
+        text, keyboard = bot._receipt_draft_view(draft, "draft")
+        self.assertIn("Итоги расходятся", text)
+        callbacks = {
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertIn("recv_total_items:draft", callbacks)
+        self.assertIn("recv_total_receipt:draft", callbacks)
+        self.assertNotIn("recv_save:draft", callbacks)
+        self.assertIn("recv_item:draft:0", callbacks)
+
     def test_bank_income_draft_is_saved_as_income(self):
         draft = self._draft()
         draft["tx_type"] = "income"
@@ -474,6 +538,7 @@ class AtomicReceiptTests(unittest.TestCase):
     def test_deleting_last_receipt_item_removes_orphan_receipt(self):
         draft = self._draft()
         draft["items"] = [{"name": "only", "price": 10.0, "category": "Продукты"}]
+        draft["total"] = 10.0
         db.save_state("receipt_draft", "one", draft, user_id=1)
         receipt_id, _ = db.save_receipt_draft(1, "one", "2026-08-20")
         with db.get_conn() as conn:

@@ -82,6 +82,10 @@ class RestoreEntry(StatesGroup):
     awaiting_file = State()
 
 
+class ReceiptDraftEdit(StatesGroup):
+    entering_item = State()
+
+
 # ---------------------------------------------------------------------------
 # Вспомогательные функции клавиатур
 # ---------------------------------------------------------------------------
@@ -213,17 +217,7 @@ async def _process_receipt(message: Message, bot: Bot, file_id: str, unique_id: 
     draft_id = uuid.uuid4().hex[:16]
     db.save_state(RECEIPT_SCOPE, draft_id, parsed, user_id=message.from_user.id)
 
-    text = _format_receipt_preview(parsed)
-    if len(text) > 3500:
-        text = text[:3500].rstrip() + "\n… позиции обрезаны в превью, при сохранении запишутся все."
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Сохранить всё", callback_data=f"recv_save:{draft_id}"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data=f"recv_cancel:{draft_id}"),
-            ]
-        ]
-    )
+    text, keyboard = _receipt_draft_view(parsed, draft_id)
     await status.edit_text(text, reply_markup=keyboard)
 
 
@@ -248,11 +242,199 @@ def _format_receipt_preview(parsed: dict) -> str:
     lines.append(f"\nИтого по товарам: {money(total)}")
     if parsed["total"] is not None:
         lines.append(f"Итого по чеку: {money(parsed['total'])}")
-    lines.append(
-        "\nЕсли что-то распознано неверно - удобнее скорректировать это "
-        "потом прямо в базе, либо переснять чек. Проверь и сохрани."
-    )
+        if abs(total - float(parsed["total"])) > 1:
+            lines.append(
+                f"\n⚠️ Итоги расходятся на {money(abs(total - float(parsed['total'])))}. "
+                "Выбери, какой сумме верить."
+            )
+    lines.append("\nПроверь позиции: их можно исправить или удалить до сохранения.")
     return "\n".join(lines)
+
+
+def _receipt_draft_view(parsed: dict, draft_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    text = _format_receipt_preview(parsed)
+    if len(text) > 3500:
+        text = text[:3500].rstrip() + "\n… часть позиций не показана, но доступна кнопками ниже."
+
+    buttons = []
+    for index, item in enumerate(parsed.get("items") or []):
+        label = str(item.get("name") or f"Позиция {index + 1}")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"✏️/🗑 {label}"[:58],
+                callback_data=f"recv_item:{draft_id}:{index}",
+            )
+        ])
+
+    item_total = sum(float(item["price"]) for item in parsed.get("items") or [])
+    receipt_total = parsed.get("total")
+    mismatch = (
+        receipt_total is not None
+        and abs(item_total - float(receipt_total)) > 1
+    )
+    if mismatch:
+        buttons.append([
+            InlineKeyboardButton(
+                text="🛒 Верить товарам",
+                callback_data=f"recv_total_items:{draft_id}",
+            ),
+            InlineKeyboardButton(
+                text="🧾 Верить итогу",
+                callback_data=f"recv_total_receipt:{draft_id}",
+            ),
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"recv_cancel:{draft_id}")
+        ])
+    else:
+        buttons.append([
+            InlineKeyboardButton(text="✅ Сохранить всё", callback_data=f"recv_save:{draft_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"recv_cancel:{draft_id}"),
+        ])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _refresh_receipt_draft(callback: CallbackQuery, draft_id: str, parsed: dict) -> None:
+    text, keyboard = _receipt_draft_view(parsed, draft_id)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("recv_item:"))
+async def receipt_draft_item_actions(callback: CallbackQuery):
+    _, draft_id, index_raw = callback.data.split(":")
+    index = int(index_raw)
+    parsed = db.get_receipt_draft(callback.from_user.id, draft_id)
+    if parsed is None or index < 0 or index >= len(parsed.get("items") or []):
+        await callback.answer("Черновик или позиция устарели", show_alert=True)
+        return
+    item = parsed["items"][index]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✏️ Исправить", callback_data=f"recv_edit:{draft_id}:{index}"
+            ),
+            InlineKeyboardButton(
+                text="🗑 Удалить", callback_data=f"recv_drop:{draft_id}:{index}"
+            ),
+        ],
+        [InlineKeyboardButton(text="◀️ К чеку", callback_data=f"recv_back:{draft_id}")],
+    ])
+    await callback.message.edit_text(
+        f"<b>{hx(item.get('name'))}</b> — {money(item.get('price'))}",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("recv_back:"))
+async def receipt_draft_back(callback: CallbackQuery):
+    draft_id = callback.data.split(":", 1)[1]
+    parsed = db.get_receipt_draft(callback.from_user.id, draft_id)
+    if parsed is None:
+        await callback.answer("Черновик устарел", show_alert=True)
+        return
+    await _refresh_receipt_draft(callback, draft_id, parsed)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("recv_edit:"))
+async def receipt_draft_edit_start(callback: CallbackQuery, state: FSMContext):
+    _, draft_id, index_raw = callback.data.split(":")
+    index = int(index_raw)
+    parsed = db.get_receipt_draft(callback.from_user.id, draft_id)
+    if parsed is None or index < 0 or index >= len(parsed.get("items") or []):
+        await callback.answer("Черновик или позиция устарели", show_alert=True)
+        return
+    item = parsed["items"][index]
+    await state.update_data(receipt_draft_id=draft_id, receipt_item_index=index)
+    await state.set_state(ReceiptDraftEdit.entering_item)
+    await callback.message.edit_text(
+        "Введи название и цену через <code>|</code>:\n"
+        f"<code>{hx(item.get('name'))} | {item.get('price')}</code>\n\n"
+        "Например: <code>Молоко 2,5% | 450</code>\n"
+        "/cancel — отмена."
+    )
+    await callback.answer()
+
+
+@router.message(ReceiptDraftEdit.entering_item)
+async def receipt_draft_edit_apply(message: Message, state: FSMContext):
+    if not message.text or "|" not in message.text:
+        await message.answer("Формат: название | цена. Например: Молоко | 450")
+        return
+    name, price_text = (part.strip() for part in message.text.rsplit("|", 1))
+    price = parse_positive_amount(price_text)
+    if not name or price is None:
+        await message.answer("Нужно непустое название и цена больше нуля.")
+        return
+    data = await state.get_data()
+    try:
+        parsed = db.update_receipt_draft_item(
+            message.from_user.id,
+            data["receipt_draft_id"],
+            data["receipt_item_index"],
+            name,
+            price,
+        )
+    except (IndexError, ValueError):
+        parsed = None
+    await state.clear()
+    if parsed is None:
+        await message.answer("Черновик или позиция устарели. Пришли фото заново.")
+        return
+    text, keyboard = _receipt_draft_view(parsed, data["receipt_draft_id"])
+    await message.answer(f"✅ Позиция обновлена.\n\n{text}", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("recv_drop:"))
+async def receipt_draft_delete_item(callback: CallbackQuery):
+    _, draft_id, index_raw = callback.data.split(":")
+    try:
+        parsed = db.delete_receipt_draft_item(
+            callback.from_user.id, draft_id, int(index_raw)
+        )
+    except IndexError:
+        parsed = None
+    except ValueError:
+        await callback.answer("Последнюю позицию удалить нельзя — отмени весь чек.", show_alert=True)
+        return
+    if parsed is None:
+        await callback.answer("Черновик или позиция устарели", show_alert=True)
+        return
+    await _refresh_receipt_draft(callback, draft_id, parsed)
+    await callback.answer("Позиция удалена")
+
+
+@router.callback_query(F.data.startswith("recv_total_items:"))
+async def receipt_draft_use_items_total(callback: CallbackQuery):
+    draft_id = callback.data.split(":", 1)[1]
+    try:
+        parsed = db.resolve_receipt_draft_total(
+            callback.from_user.id, draft_id, use_receipt_total=False
+        )
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        await callback.answer("Не удалось обновить черновик", show_alert=True)
+        return
+    await _refresh_receipt_draft(callback, draft_id, parsed)
+    await callback.answer("Использую сумму товаров")
+
+
+@router.callback_query(F.data.startswith("recv_total_receipt:"))
+async def receipt_draft_use_receipt_total(callback: CallbackQuery):
+    draft_id = callback.data.split(":", 1)[1]
+    try:
+        parsed = db.resolve_receipt_draft_total(
+            callback.from_user.id, draft_id, use_receipt_total=True
+        )
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        await callback.answer("Итог чека некорректен", show_alert=True)
+        return
+    await _refresh_receipt_draft(callback, draft_id, parsed)
+    await callback.answer("Позиции пересчитаны по итогу чека")
 
 
 @router.callback_query(F.data.startswith("recv_save:"))
@@ -260,6 +442,15 @@ async def confirm_receipt_save(callback: CallbackQuery):
     draft_id = callback.data.split(":", 1)[1]
     user_id = callback.from_user.id
     today = date.today().isoformat()
+
+    parsed = db.get_receipt_draft(user_id, draft_id)
+    if parsed is not None:
+        item_total = sum(float(item["price"]) for item in parsed.get("items") or [])
+        receipt_total = parsed.get("total")
+        if receipt_total is not None and abs(item_total - float(receipt_total)) > 1:
+            await _refresh_receipt_draft(callback, draft_id, parsed)
+            await callback.answer("Сначала выбери, какой итог использовать", show_alert=True)
+            return
 
     try:
         result = db.save_receipt_draft(user_id, draft_id, fallback_date=today)
@@ -2428,6 +2619,7 @@ async def _backup_scheduler(bot: Bot):
         except Exception:
             logger.exception("Сбой итерации планировщика бэкапов")
         await asyncio.sleep(24 * 3600)
+
 
 
 # ---------------------------------------------------------------------------

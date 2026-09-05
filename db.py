@@ -13,6 +13,7 @@
 """
 
 import json
+import math
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -392,6 +393,13 @@ def save_receipt_draft(
         items = parsed.get("items")
         if not isinstance(items, list) or not items:
             raise ValueError("Черновик чека не содержит позиций")
+        item_total = sum(float(item["price"]) for item in items)
+        receipt_total = parsed.get("total")
+        if (
+            receipt_total is not None
+            and abs(item_total - float(receipt_total)) > 1
+        ):
+            raise ValueError("Сначала нужно выбрать итог чека")
 
         payment = conn.execute(
             """SELECT id FROM payment_methods WHERE user_id=?
@@ -463,6 +471,130 @@ def save_receipt_draft(
             raise RuntimeError("Черновик чека изменился во время сохранения")
 
         return receipt_id, touched_categories
+
+
+def get_receipt_draft(user_id: int, draft_id: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT payload FROM app_state
+               WHERE scope='receipt_draft' AND key=? AND user_id=?""",
+            (draft_id, user_id),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        parsed = json.loads(row["payload"])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _mutate_receipt_draft(user_id: int, draft_id: str, mutator) -> dict | None:
+    """Атомарно меняет принадлежащий пользователю черновик."""
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT payload FROM app_state
+               WHERE scope='receipt_draft' AND key=? AND user_id=?""",
+            (draft_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        parsed = json.loads(row["payload"])
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+            raise ValueError("Некорректный черновик чека")
+        mutator(parsed)
+        conn.execute(
+            """UPDATE app_state SET payload=?, updated_at=?
+               WHERE scope='receipt_draft' AND key=? AND user_id=?""",
+            (
+                json.dumps(parsed, ensure_ascii=False),
+                datetime.now(UTC).isoformat(),
+                draft_id,
+                user_id,
+            ),
+        )
+        return parsed
+
+
+def update_receipt_draft_item(
+    user_id: int, draft_id: str, item_index: int, name: str, price: float
+) -> dict | None:
+    name = name.strip()
+    price = float(price)
+    if not name or len(name) > 500:
+        raise ValueError("Некорректное название позиции")
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("Некорректная цена позиции")
+
+    def mutate(parsed: dict) -> None:
+        items = parsed["items"]
+        if item_index < 0 or item_index >= len(items):
+            raise IndexError("Позиция не найдена")
+        items[item_index]["name"] = name
+        items[item_index]["price"] = round(price, 2)
+        parsed.pop("total_resolution", None)
+
+    return _mutate_receipt_draft(user_id, draft_id, mutate)
+
+
+def delete_receipt_draft_item(user_id: int, draft_id: str, item_index: int) -> dict | None:
+    def mutate(parsed: dict) -> None:
+        items = parsed["items"]
+        if item_index < 0 or item_index >= len(items):
+            raise IndexError("Позиция не найдена")
+        if len(items) == 1:
+            raise ValueError("Нельзя удалить последнюю позицию")
+        items.pop(item_index)
+        parsed.pop("total_resolution", None)
+
+    return _mutate_receipt_draft(user_id, draft_id, mutate)
+
+
+def resolve_receipt_draft_total(
+    user_id: int, draft_id: str, use_receipt_total: bool
+) -> dict | None:
+    """Выбирает сумму товаров либо масштабирует позиции до итога чека."""
+    def mutate(parsed: dict) -> None:
+        items = parsed["items"]
+        if not items:
+            raise ValueError("Черновик чека не содержит позиций")
+        prices = [float(item["price"]) for item in items]
+        if any(not math.isfinite(price) or price <= 0 for price in prices):
+            raise ValueError("Некорректная цена позиции")
+
+        if not use_receipt_total:
+            parsed["total"] = round(sum(prices), 2)
+            parsed["total_resolution"] = "items"
+            return
+
+        total = float(parsed.get("total"))
+        if not math.isfinite(total) or total <= 0:
+            raise ValueError("В чеке нет корректного итога")
+        target_cents = round(total * 100)
+        if target_cents < len(items):
+            raise ValueError("Итог слишком мал для количества позиций")
+
+        # Распределяем итог пропорционально исходным ценам в целых тиынах,
+        # чтобы сумма записанных операций совпала с итогом чека до копейки.
+        price_sum = sum(prices)
+        distributable = target_cents - len(items)
+        shares = [distributable * price / price_sum for price in prices]
+        cents = [1 + int(share) for share in shares]
+        remainder = target_cents - sum(cents)
+        order = sorted(
+            range(len(items)),
+            key=lambda index: shares[index] - int(shares[index]),
+            reverse=True,
+        )
+        for index in order[:remainder]:
+            cents[index] += 1
+        for item, amount_cents in zip(items, cents):
+            item["price"] = amount_cents / 100
+        parsed["total"] = target_cents / 100
+        parsed["total_resolution"] = "receipt"
+
+    return _mutate_receipt_draft(user_id, draft_id, mutate)
 
 
 def get_transactions(user_id: int, date_from: str, date_to: str) -> list[sqlite3.Row]:
