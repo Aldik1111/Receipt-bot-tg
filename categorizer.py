@@ -7,7 +7,7 @@
 "Хлеб бородинский", "Такси поездка" и т.п.)
 """
 
-from config import DEFAULT_CATEGORIES
+from config import DEFAULT_CATEGORIES, default_categories_for, protected_category_name
 
 
 def categorize(item_name: str, categories_keywords: dict[str, list[str]] | None = None) -> str:
@@ -21,7 +21,10 @@ def categorize(item_name: str, categories_keywords: dict[str, list[str]] | None 
 
     name = item_name.lower()
 
-    best_category = "Прочее"
+    best_category = next(
+        (cat for cat, keywords in categories_keywords.items() if not keywords),
+        "Прочее",
+    )
     best_score = 0
 
     for category, keywords in categories_keywords.items():
@@ -36,8 +39,11 @@ def categorize(item_name: str, categories_keywords: dict[str, list[str]] | None 
 def categorize_many(user_id: int, item_names: list[str]) -> list[str]:
     """Категории для списка названий. Неизвестные товары — один вызов Gemini."""
     import db
-    from gemini_engine import guess_categories_ai
 
+    owner_id = db.scope_user(user_id)
+    lang = db.get_user_language(owner_id)
+    fallback = protected_category_name(lang)
+    catalog = default_categories_for(lang)
     category_names = [c["name"] for c in db.get_categories(user_id)]
     results: list[str | None] = [None] * len(item_names)
     unknown: list[tuple[int, str]] = []
@@ -45,28 +51,38 @@ def categorize_many(user_id: int, item_names: list[str]) -> list[str]:
     for index, item_name in enumerate(item_names):
         normalized = (item_name or "").strip().lower()
         if not normalized:
-            results[index] = "Прочее"
+            results[index] = fallback
             continue
         learned = db.get_learned_category_name(user_id, normalized)
         if learned:
             results[index] = learned
             continue
-        local = categorize(item_name)
-        if local != "Прочее":
+        local = categorize(item_name, catalog)
+        if local != fallback and local in category_names:
             results[index] = local
             continue
         unknown.append((index, item_name))
 
     if unknown:
-        guesses = guess_categories_ai([name for _, name in unknown], category_names)
+        from gemini_engine import call_with_quota, guess_categories_ai
+
+        day = db.user_today(user_id).isoformat()
+        guesses, _err = call_with_quota(
+            user_id,
+            day,
+            lambda: guess_categories_ai(
+                [name for _, name in unknown], category_names
+            ),
+        )
+        guesses = guesses or {}
         for index, item_name in unknown:
             guess = guesses.get(item_name)
             if guess and guess in category_names:
                 results[index] = guess
             else:
-                results[index] = "Прочее"
+                results[index] = fallback
 
-    return [name or "Прочее" for name in results]
+    return [name or fallback for name in results]
 
 
 def categorize_smart(user_id: int, item_name: str) -> str:

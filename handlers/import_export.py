@@ -2,56 +2,26 @@ import asyncio
 import io
 import json
 import logging
-import os
-import re
-import tempfile
 import uuid
-from collections import defaultdict
-from datetime import date, datetime, timedelta
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramRetryAfter
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import (
-    BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, Message,
-)
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-import backup
-import bank_import
-import charts
+from categorizer import categorize_many
+from formatting import hx
+from handlers.common import MAX_IMPORT_BYTES, MAX_RESTORE_BYTES, IMPORT_SCOPE, RESTORE_SCOPE, RestoreEntry
+from handlers.stats import _period_bounds
+from i18n import format_money, t
+from keyboards.common import with_back_button
 import db
 import export
-from categorizer import categorize, categorize_many, categorize_smart
-from config import ADMIN_USER_ID, GEMINI_DAILY_LIMIT
-from fingerprints import (
-    bank_fingerprint, photo_sha256_fingerprint, photo_telegram_fingerprint,
-)
-from formatting import hx, money, parse_positive_amount
-from gemini_engine import generate_insight_text
-from i18n import format_money, t
-from image_prep import (
-    MAX_RECEIPT_BYTES, ReceiptImageError, prepare_receipt_image, sha256_file,
-)
-from money import tiyn_to_tenge
-from receipt_pipeline import extract_receipt
-from timeutil import TIMEZONE_CHOICES
-
-from handlers.common import *
-from keyboards.common import (
-    categories_keyboard, payments_keyboard, period_keyboard, with_back_button,
-)
 
 _with_back_button = with_back_button
 logger = logging.getLogger(__name__)
 
-
-from handlers.stats import _period_bounds
-
-
-router = Router(name="import_export")
-
+router = Router(name='import_export')
 
 @router.message(Command("export"))
 async def cmd_export(message: Message):

@@ -459,7 +459,8 @@ EN = {
     "danger_intro": (
         "⚠️ <b>This will permanently delete:</b>\n"
         "— {count} transactions\n"
-        "— all categories, payment methods, budgets and goals\n\n"
+        "— all categories, payment methods, budgets and goals\n"
+        "— access for {members} family book members\n\n"
         "This cannot be undone (unless you made a /settings backup first).\n\n"
         "Continue?"
     ),

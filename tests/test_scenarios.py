@@ -56,6 +56,7 @@ def fake_message(text: str, user_id: int = 1):
         message_id=10,
         from_user=SimpleNamespace(id=user_id, username="tester"),
         chat=SimpleNamespace(id=user_id),
+        bot=SimpleNamespace(send_message=AsyncMock()),
         answer=AsyncMock(),
     )
 

@@ -1,56 +1,30 @@
 import asyncio
-import io
-import json
 import logging
 import os
-import re
 import tempfile
 import uuid
-from collections import defaultdict
-from datetime import date, datetime, timedelta
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramRetryAfter
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import (
-    BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, Message,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-import backup
-import bank_import
-import charts
-import db
-import export
-from categorizer import categorize, categorize_many, categorize_smart
-from config import ADMIN_USER_ID, GEMINI_DAILY_LIMIT
-from fingerprints import (
-    bank_fingerprint, photo_sha256_fingerprint, photo_telegram_fingerprint,
-)
-from formatting import hx, money, parse_positive_amount
-from gemini_engine import generate_insight_text
+from config import GEMINI_DAILY_LIMIT
+from fingerprints import photo_sha256_fingerprint, photo_telegram_fingerprint
+from formatting import hx, parse_positive_amount
+from handlers.common import RECEIPT_SCOPE, DUP_SCOPE, ReceiptDraftEdit
+from handlers.stats import _budget_warnings_text
 from i18n import format_date, format_money, t, type_label
-from image_prep import (
-    MAX_RECEIPT_BYTES, ReceiptImageError, prepare_receipt_image, sha256_file,
-)
+from image_prep import MAX_RECEIPT_BYTES, ReceiptImageError, prepare_receipt_image, sha256_file
+from keyboards.common import payments_keyboard, with_back_button
 from money import tiyn_to_tenge
 from receipt_pipeline import extract_receipt
-from timeutil import TIMEZONE_CHOICES
-
-from handlers.common import *
-from keyboards.common import (
-    categories_keyboard, payments_keyboard, period_keyboard, with_back_button,
-)
+import db
 
 _with_back_button = with_back_button
 logger = logging.getLogger(__name__)
 
-
-from handlers.stats import _budget_warnings_text
-
-
-router = Router(name="receipt")
+router = Router(name='receipt')
 
 def SOURCE_LABELS(lang: str = "ru") -> dict[str, str]:
     return {
@@ -115,8 +89,9 @@ def _recognize_receipt_image(user_id: int, local_path: str, day: str, unique_id:
         fingerprints.append(photo_telegram_fingerprint(unique_id))
     fingerprints.append(photo_sha256_fingerprint(digest))
     seen = db.find_fingerprint(user_id, "photo", fingerprints)
-    allowed, used = db.try_consume_gemini_quota(user_id, day)
-    if not allowed:
+    parsed, err = extract_receipt(prepared, user_id)
+    used = db.get_gemini_quota_used(user_id, day)
+    if err == "quota":
         logger.info("gemini_quota denied user=%s day=%s used=%s", user_id, day, used)
         return {
             "error": "quota",
@@ -125,9 +100,6 @@ def _recognize_receipt_image(user_id: int, local_path: str, day: str, unique_id:
             "used": used,
             "prepared": prepared,
         }
-    parsed, err = extract_receipt(prepared, user_id)
-    if err in {"rate_limit", "network", "bad_json", "unavailable", "no_key"}:
-        used = db.refund_gemini_quota(user_id, day)
     total = db.get_gemini_usage_total(day)
     logger.info(
         "gemini_quota user=%s day=%s used=%s limit=%s total_day=%s err=%s",

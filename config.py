@@ -27,7 +27,7 @@ BOT_TOKEN = _env("BOT_TOKEN")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")
 
 # Версия политики, которую пользователь принимает в /start и /privacy.
-PRIVACY_POLICY_VERSION = os.getenv("PRIVACY_POLICY_VERSION", "2026-08-20")
+PRIVACY_POLICY_VERSION = os.getenv("PRIVACY_POLICY_VERSION", "2026-09-15")
 
 # Путь к файлу базы данных SQLite
 DB_PATH = os.getenv("DB_PATH", "budget.db")
@@ -90,6 +90,74 @@ DEFAULT_CATEGORY_EMOJIS = {
 }
 
 DEFAULT_PAYMENT_METHODS = ["Наличные", "Карта (основная)"]
+
+DEFAULT_CATEGORY_NAMES = {
+    "ru": list(DEFAULT_CATEGORIES.keys()),
+    "en": [
+        "Groceries",
+        "Cafes and restaurants",
+        "Transport",
+        "Clothes and shoes",
+        "Health and pharmacy",
+        "Entertainment",
+        "Utilities and comms",
+        "Home",
+        "Other",
+    ],
+    "kk": [
+        "Азық-түлік",
+        "Кафе мен мейрамханалар",
+        "Көлік",
+        "Киім мен аяқ киім",
+        "Денсаулық пен дәріхана",
+        "Ойын-сауық",
+        "Коммуналдық және байланыс",
+        "Үй",
+        "Басқа",
+    ],
+}
+
+DEFAULT_PAYMENT_METHODS_I18N = {
+    "ru": ["Наличные", "Карта (основная)"],
+    "en": ["Cash", "Card (main)"],
+    "kk": ["Қолма-қол", "Карта (негізгі)"],
+}
+
+
+def default_categories_for(lang: str) -> dict[str, list[str]]:
+    names = DEFAULT_CATEGORY_NAMES.get(lang) or DEFAULT_CATEGORY_NAMES["ru"]
+    return {
+        names[index]: keywords
+        for index, (_ru, keywords) in enumerate(DEFAULT_CATEGORIES.items())
+    }
+
+
+def default_emojis_for(lang: str) -> dict[str, str]:
+    names = DEFAULT_CATEGORY_NAMES.get(lang) or DEFAULT_CATEGORY_NAMES["ru"]
+    ru_names = list(DEFAULT_CATEGORIES.keys())
+    return {
+        names[index]: DEFAULT_CATEGORY_EMOJIS[ru_names[index]]
+        for index in range(len(ru_names))
+    }
+
+
+def protected_category_name(lang: str = "ru") -> str:
+    names = DEFAULT_CATEGORY_NAMES.get(lang) or DEFAULT_CATEGORY_NAMES["ru"]
+    return names[-1]
+
+
+def all_protected_category_names() -> frozenset[str]:
+    return frozenset(names[-1] for names in DEFAULT_CATEGORY_NAMES.values())
+
+
+def localize_default_category(ru_name: str, lang: str) -> str:
+    ru_names = list(DEFAULT_CATEGORIES.keys())
+    try:
+        index = ru_names.index(ru_name)
+    except ValueError:
+        return ru_name
+    names = DEFAULT_CATEGORY_NAMES.get(lang) or ru_names
+    return names[index]
 
 # Валюта фиксирована - тенге. Символ используется во всех местах, где
 # показывается сумма (см. formatting.py)

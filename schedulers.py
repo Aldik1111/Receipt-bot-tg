@@ -126,6 +126,7 @@ async def run_digest_once(bot: Bot) -> None:
                     ],
                 },
                 lang,
+                user_id,
             )
             if insight:
                 text += f"\n\n💡 {hx(insight)}"

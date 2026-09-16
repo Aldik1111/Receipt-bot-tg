@@ -52,6 +52,36 @@ class FamilyBillingTests(unittest.TestCase):
         self.assertEqual(row["created_by"], 2)
         self.assertEqual(db.get_transaction_by_id(4, member_tx), None)
 
+    def test_active_book_hides_other_owned_book(self):
+        personal = db.active_book_id(1)
+        personal_tx = self._add(1, "personal-milk")
+        now = datetime.now(UTC).isoformat()
+        with db.get_conn() as conn:
+            family = conn.execute(
+                "INSERT INTO books(owner_user_id, name, created_at) VALUES (1,'family',?)",
+                (now,),
+            ).lastrowid
+            conn.execute(
+                """INSERT INTO book_members(book_id, user_id, role, joined_at)
+                   VALUES (?,?,?,?)""",
+                (family, 1, "owner", now),
+            )
+        self.assertTrue(db.switch_active_book(1, family))
+        family_tx = self._add(1, "family-bread")
+        rows = [row["description"] for row in db.get_recent_transactions(1, limit=20)]
+        self.assertEqual(rows, ["family-bread"])
+        self.assertIsNone(db.get_transaction_by_id(1, personal_tx))
+        self.assertIsNotNone(db.get_transaction_by_id(1, family_tx))
+        code = db.create_book_invite(1, "write")
+        self.assertEqual(db.join_book_invite(2, code), "ok")
+        member_rows = [row["description"] for row in db.get_recent_transactions(2, limit=20)]
+        self.assertEqual(member_rows, ["family-bread"])
+        self.assertIsNone(db.get_transaction_by_id(2, personal_tx))
+        self.assertTrue(db.switch_active_book(1, personal))
+        rows = [row["description"] for row in db.get_recent_transactions(1, limit=20)]
+        self.assertEqual(rows, ["personal-milk"])
+        self.assertIsNone(db.get_transaction_by_id(1, family_tx))
+
     def test_read_member_cannot_write(self):
         owner_tx = self._add(1)
         code = db.create_book_invite(1, "read")
@@ -85,6 +115,38 @@ class FamilyBillingTests(unittest.TestCase):
         self.assertEqual(db.scope_user(2), 2)
         self.assertIsNone(db.get_transaction_by_id(2, owner_tx))
         self.assertFalse(db.leave_active_book(1))
+
+    def test_owner_wipe_returns_members_to_personal_book(self):
+        owner_tx = self._add(1, "shared milk")
+        code = db.create_book_invite(1, "write")
+        self.assertEqual(db.join_book_invite(2, code), "ok")
+        self.assertIsNotNone(db.get_transaction_by_id(2, owner_tx))
+        members = db.delete_all_user_data(1)
+        self.assertEqual(members, [2])
+        self.assertEqual(db.scope_user(2), 2)
+        self.assertIsNone(db.get_transaction_by_id(2, owner_tx))
+        personal = self._add(2, "own bread")
+        self.assertIsNotNone(db.get_transaction_by_id(2, personal))
+        self.assertIsNone(db.get_transaction_by_id(1, personal))
+
+    def test_recurring_posts_to_book_where_created(self):
+        from datetime import date
+
+        cat = db.get_category_id_by_name(1, "Продукты")
+        pay = db.get_default_payment_method_id(1)
+        book_a = db.active_book_id(1)
+        rec_id = db.add_recurring(1, "expense", 90000, cat, pay, "rent-book", 1)
+        code = db.create_book_invite(2, "write")
+        self.assertEqual(db.join_book_invite(1, code), "ok")
+        self.assertNotEqual(db.active_book_id(1), book_a)
+        today = date(2026, 9, 15).isoformat()
+        self.assertTrue(db.apply_due_recurring(rec_id, today))
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT book_id, user_id FROM transactions WHERE description='rent-book'"
+            ).fetchone()
+        self.assertEqual(row["book_id"], book_a)
+        self.assertEqual(row["user_id"], 1)
 
     def test_start_payload_parses_join_code(self):
         self.assertEqual(start_join_code("/start join_AB12CD34"), "AB12CD34")

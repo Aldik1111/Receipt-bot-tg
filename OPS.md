@@ -1,4 +1,4 @@
-# Production runbook
+ # Production runbook
 
 Этот файл про сервер, не про фичи бота. Юридическая оферта, смена
 секретов и чистка git-истории сюда не входят.
@@ -24,11 +24,14 @@ Caddy слушает 80/443, отдаёт `webapp/` и проксирует `/ap
 
 ## Health
 
-- Бот: `python scripts/healthcheck.py --db-only` (SQLite + сердцебиение планировщиков).
-- Mini App: `GET /health` → `{"status":"ok"|"degraded","db":"ok",...}`.
+- Бот (внутри сети): `python scripts/healthcheck.py --db-only` — SQLite и
+  имена/статус планировщиков.
+- Публичный Mini App: `GET /health` → `{"status":"ok"|"degraded","db":"ok"}`
+  без ключей `schedulers`.
 - Снаружи: `python scripts/healthcheck.py --url https://DOMAIN/health`.
 
 `degraded` значит база жива, но какой-то планировщик давно не отмечался.
+Имена задач смотри через `--db-only`, не через публичный URL.
 Это не повод сразу рестартить том с базой — сначала логи.
 
 ## Логи

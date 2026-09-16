@@ -23,6 +23,10 @@ from money import MoneyError, tenge_to_tiyn
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 60  # Gemini 3 сначала «думает», 30с часто рвёт vision-запрос
+# Слот квоты возвращаем только если запрос не дошёл до полезного ответа.
+QUOTA_REFUND_ERRORS = frozenset(
+    {"rate_limit", "network", "bad_json", "unavailable", "no_key"}
+)
 # Если алиас 404 — пробуем актуальные Flash-модели по очереди.
 GEMINI_MODEL_FALLBACKS = (
     GEMINI_MODEL,
@@ -273,6 +277,19 @@ def _post_gemini(body: dict) -> tuple[dict | None, str | None]:
     return None, "unavailable"
 
 
+def call_with_quota(user_id: int, day: str, fn):
+    """Занимает слот, вызывает fn() -> (result, err), refund при сбое сети/API."""
+    import db
+
+    allowed, _used = db.try_consume_gemini_quota(user_id, day)
+    if not allowed:
+        return None, "quota"
+    result, err = fn()
+    if err in QUOTA_REFUND_ERRORS:
+        db.refund_gemini_quota(user_id, day)
+    return result, err
+
+
 def get_receipt_from_gemini(image_path: str) -> tuple[dict | None, str | None]:
     if not GEMINI_API_KEY:
         logger.info("GEMINI_API_KEY не задан - шаг с Gemini пропускается")
@@ -322,24 +339,31 @@ def get_receipt_from_gemini(image_path: str) -> tuple[dict | None, str | None]:
     return parsed, None
 
 
-def _text_request(prompt: str, max_tokens: int = 200) -> str | None:
+def _text_request(prompt: str, max_tokens: int = 200) -> tuple[str | None, str | None]:
     """Общая обёртка для текстовых (не по фото) запросов к Gemini."""
     if not GEMINI_API_KEY:
-        return None
+        return None, "no_key"
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
     }
     payload, err = _post_gemini(body)
-    if err or not payload:
-        return None
-    return _candidate_text(payload)
+    if err:
+        return None, err
+    if not payload:
+        return None, "unavailable"
+    text = _candidate_text(payload)
+    if not text:
+        return None, "bad_json"
+    return text, None
 
 
-def guess_categories_ai(item_names: list[str], category_names: list[str]) -> dict[str, str]:
+def guess_categories_ai(
+    item_names: list[str], category_names: list[str]
+) -> tuple[dict[str, str], str | None]:
     """Один запрос на пачку неизвестных товаров вместо N+1."""
     if not item_names:
-        return {}
+        return {}, None
     numbered = "\n".join(f"{i+1}. {name}" for i, name in enumerate(item_names[:80]))
     prompt = (
         f"Категории (только из этого списка): {', '.join(category_names)}\n"
@@ -347,29 +371,32 @@ def guess_categories_ai(item_names: list[str], category_names: list[str]) -> dic
         "Верни JSON-объект, где ключ - номер товара (строка), значение - "
         "название категории из списка. Без пояснений."
     )
-    result = _text_request(prompt, max_tokens=400)
-    if not result:
-        return {}
+    result, err = _text_request(prompt, max_tokens=400)
+    if err:
+        return {}, err
     try:
         data = _loads_model_json(result)
     except json.JSONDecodeError:
-        return {}
+        return {}, "bad_json"
     if not isinstance(data, dict):
-        return {}
+        return {}, "bad_json"
     allowed = set(category_names)
     mapped = {}
     for i, name in enumerate(item_names[:80], start=1):
         guess = data.get(str(i)) or data.get(i)
         if isinstance(guess, str) and guess in allowed:
             mapped[name] = guess
-    return mapped
+    return mapped, None
 
 
 def guess_category_ai(item_name: str, category_names: list[str]) -> str | None:
-    return guess_categories_ai([item_name], category_names).get(item_name)
+    mapped, _err = guess_categories_ai([item_name], category_names)
+    return mapped.get(item_name)
 
 
-def generate_insight_text(summary: dict, lang: str = "ru") -> str | None:
+def generate_insight_text(
+    summary: dict, lang: str = "ru", user_id: int | None = None
+) -> str | None:
     """Короткий человеческий вывод по статистике для автосводки/дайджеста."""
     lang_names = {"ru": "русском", "kk": "казахском", "en": "английском"}
     prompt = (
@@ -379,4 +406,13 @@ def generate_insight_text(summary: dict, lang: str = "ru") -> str | None:
         f"{lang_names.get(lang, 'русском')} языке - по-дружески, без канцелярита, "
         f"без markdown-разметки, без вступлений вида 'вот наблюдение'."
     )
-    return _text_request(prompt, max_tokens=150)
+    if user_id is None:
+        text, _err = _text_request(prompt, max_tokens=150)
+        return text
+    import db
+
+    day = db.user_today(user_id).isoformat()
+    text, _err = call_with_quota(
+        user_id, day, lambda: _text_request(prompt, max_tokens=150)
+    )
+    return text

@@ -1,57 +1,24 @@
 import asyncio
-import io
-import json
 import logging
-import os
-import re
-import tempfile
-import uuid
-from collections import defaultdict
-from datetime import date, datetime, timedelta
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import (
-    BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, Message,
-)
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-import backup
-import bank_import
-import charts
-import db
-import export
-from categorizer import categorize, categorize_many, categorize_smart
-from config import ADMIN_USER_ID, GEMINI_DAILY_LIMIT
-from fingerprints import (
-    bank_fingerprint, photo_sha256_fingerprint, photo_telegram_fingerprint,
-)
-from formatting import hx, money, parse_positive_amount
-from gemini_engine import generate_insight_text
+from handlers.common import DIGEST_FREQ_LABELS, DangerZone
 from i18n import LANGUAGES, t
+from keyboards.common import with_back_button
 from telegram_ui import apply_user_ui
-from image_prep import (
-    MAX_RECEIPT_BYTES, ReceiptImageError, prepare_receipt_image, sha256_file,
-)
-from money import tiyn_to_tenge
-from receipt_pipeline import extract_receipt
 from timeutil import TIMEZONE_CHOICES
-
-from handlers.common import *
-from keyboards.common import (
-    categories_keyboard, payments_keyboard, period_keyboard, with_back_button,
-)
+import backup
+import db
 
 _with_back_button = with_back_button
 logger = logging.getLogger(__name__)
 
-
-
-
-router = Router(name="settings")
-
+router = Router(name='settings')
 
 @router.message(Command("language"))
 async def cmd_language(message: Message):
@@ -254,13 +221,14 @@ async def settings_backup_now(callback: CallbackQuery):
 async def danger_start(callback: CallbackQuery):
     user_id = callback.from_user.id
     count = db.count_user_data(user_id)
+    members = len(db.list_owned_book_member_ids(user_id))
     lang = db.get_user_language(user_id)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=t("danger_confirm", lang), callback_data="danger_confirm1"),
         InlineKeyboardButton(text=t("cancel_button", lang), callback_data="danger_cancel"),
     ]])
     await callback.message.edit_text(
-        t("danger_intro", lang, count=count),
+        t("danger_intro", lang, count=count, members=members),
         reply_markup=keyboard,
     )
     await callback.answer()
@@ -281,8 +249,23 @@ async def danger_confirm2(message: Message, state: FSMContext):
     if not message.text or message.text.strip() != t("danger_phrase", lang):
         await message.answer(t("danger_mismatch", lang))
         return
-    db.delete_all_user_data(message.from_user.id)
+    members = db.delete_all_user_data(message.from_user.id)
     await message.answer(t("danger_done", lang))
+    bot = getattr(message, "bot", None)
+    if bot is None:
+        return
+    for member_id in members:
+        try:
+            member_lang = db.get_user_language(member_id)
+            await bot.send_message(
+                member_id,
+                t("family_book_deleted", member_lang),
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось сообщить участнику %s об удалении книги",
+                member_id,
+            )
 
 @router.callback_query(F.data == "danger_cancel")
 async def danger_cancel(callback: CallbackQuery):
