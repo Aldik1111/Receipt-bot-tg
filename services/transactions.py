@@ -85,11 +85,7 @@ def create_quick_transaction(
         return None
 
     description = description_text.strip() or None
-    category_name = (
-        categorize_smart(user_id, description)
-        if description
-        else "Прочее"
-    )
+    category_name = categorize_smart(user_id, description or "")
     category_id = db.get_category_id_by_name(user_id, category_name)
     payment_method_id = db.get_default_payment_method_id(user_id)
     now = db.user_now(user_id)

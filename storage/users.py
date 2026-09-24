@@ -1,7 +1,13 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for users."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from datetime import date, datetime
+import sqlite3
+
+from timeutil import TIMEZONE_CHOICES, normalize_timezone, now_in_tz, today_in_tz
+
+from storage import books, catalog
+from storage.conn import get_conn
 
 # ---------------------------------------------------------------------------
 # Язык и настройка автосводки
@@ -45,7 +51,7 @@ def set_user_language(user_id: int, lang: str) -> None:
             "UPDATE users SET language=? WHERE user_id=?",
             (normalized, user_id),
         )
-    maybe_reseed_default_catalog(user_id, normalized)
+    catalog.maybe_reseed_default_catalog(user_id, normalized)
 
 
 def is_onboarded(user_id: int) -> bool:
@@ -108,9 +114,9 @@ def mark_digest_sent(user_id: int, sent_date: str) -> None:
 # ---------------------------------------------------------------------------
 
 def learn_category(user_id: int, keyword: str, category_id: int) -> None:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
-        if _owned_category_id(conn, user_id, category_id) != category_id:
+        if catalog._owned_category_id(conn, user_id, category_id) != category_id:
             return
         conn.execute(
             """INSERT INTO learned_categories(user_id, keyword, category_id) VALUES (?,?,?)
@@ -120,7 +126,7 @@ def learn_category(user_id: int, keyword: str, category_id: int) -> None:
 
 
 def get_learned_category_name(user_id: int, keyword: str) -> str | None:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         row = conn.execute(
             """SELECT c.name FROM learned_categories lc
@@ -136,7 +142,7 @@ def get_learned_category_name(user_id: int, keyword: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def set_category_emoji(user_id: int, category_id: int, emoji: str) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE categories SET emoji=? WHERE id=? AND user_id=?", (emoji, category_id, user_id)

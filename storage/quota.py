@@ -1,13 +1,17 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for quota."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from fingerprints import import_row_fingerprint
+from money import as_stored_tiyn
+
+from storage import books
+from storage.conn import get_conn
 
 def try_consume_gemini_quota(
     user_id: int, day: str, limit: int | None = None
 ) -> tuple[bool, int]:
     """Атомарно занимает слот распознавания. BEGIN IMMEDIATE закрывает гонку."""
-    cap = gemini_daily_limit(user_id) if limit is None else limit
+    cap = books.gemini_daily_limit(user_id) if limit is None else limit
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -74,7 +78,7 @@ def _remember_fingerprint(
 
 def find_fingerprint(user_id: int, kind: str, fingerprints: list[str]) -> str | None:
     """Возвращает last_seen ближайшего известного отпечатка."""
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     marks = [item for item in fingerprints if item]
     if not marks:
         return None
@@ -90,7 +94,7 @@ def find_fingerprint(user_id: int, kind: str, fingerprints: list[str]) -> str | 
 
 
 def count_import_duplicates(user_id: int, rows: list[dict], fallback_date: str) -> int:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     if not rows:
         return 0
     marks = [

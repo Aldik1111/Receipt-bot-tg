@@ -1,7 +1,13 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for backup."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from datetime import UTC, datetime
+
+from money import backup_amount_to_tiyn, backup_signed_amount_to_tiyn
+from timeutil import normalize_timezone
+
+from storage import catalog, goals, wipe
+from storage.conn import BACKUP_VERSION, TX_ALL_TYPES, get_conn
 
 # ---------------------------------------------------------------------------
 # Полный личный бэкап (для JSON-выгрузки, НЕ вся общая база - см. backup.py)
@@ -119,7 +125,7 @@ def restore_user_backup(user_id: int, data: dict) -> dict[str, int]:
                    idle_reminder_enabled, backup_enabled) VALUES (?,?,?,?,?)""",
                 (user_id, None, datetime.now(UTC).isoformat(), 0, 0),
             )
-        _wipe_user_finance(conn, user_id, delete_user=False, wipe_books=False)
+        wipe._wipe_user_finance(conn, user_id, delete_user=False, wipe_books=False)
 
         amount_unit = data.get("amount_unit")
         if not amount_unit:
@@ -158,11 +164,11 @@ def restore_user_backup(user_id: int, data: dict) -> dict[str, int]:
 
         def cat_id(name):
             if not name:
-                return _owned_category_id(conn, user_id, None)
+                return catalog._owned_category_id(conn, user_id, None)
             row = conn.execute(
                 "SELECT id FROM categories WHERE user_id=? AND name=?", (user_id, name)
             ).fetchone()
-            return row["id"] if row else _owned_category_id(conn, user_id, None)
+            return row["id"] if row else catalog._owned_category_id(conn, user_id, None)
 
         def pm_id(name):
             if not name:
@@ -203,7 +209,7 @@ def restore_user_backup(user_id: int, data: dict) -> dict[str, int]:
                     goal["name"],
                     backup_amount_to_tiyn(goal["target_amount"], amount_unit),
                     backup_amount_to_tiyn(goal.get("current_amount") or 0, amount_unit),
-                    _parse_iso_date(goal.get("deadline")),
+                    goals._parse_iso_date(goal.get("deadline")),
                     goal.get("created_at") or now,
                 ),
             )

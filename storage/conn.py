@@ -1,31 +1,9 @@
 """Соединение SQLite, константы схемы и мелкие PRAGMA-хелперы."""
-import json
-import secrets
+from contextlib import contextmanager
 import sqlite3
 import sys
-from contextlib import contextmanager
-from datetime import UTC, date, datetime, timedelta
 
-from config import (
-    BOOK_INVITE_HOURS,
-    DB_PATH,
-    DEFAULT_CATEGORIES,
-    DEFAULT_CATEGORY_EMOJIS,
-    DEFAULT_PAYMENT_METHODS,
-    DEFAULT_PAYMENT_METHODS_I18N,
-    GEMINI_DAILY_LIMIT,
-    GEMINI_PRO_LIMIT,
-    PLAN_FREE,
-    PLAN_PRO,
-    PRO_DURATION_DAYS,
-    all_protected_category_names,
-    default_categories_for,
-    default_emojis_for,
-    protected_category_name,
-)
-from fingerprints import import_row_fingerprint
-from money import MoneyError, as_stored_tiyn, backup_amount_to_tiyn, backup_signed_amount_to_tiyn
-from timeutil import DEFAULT_TIMEZONE, TIMEZONE_CHOICES, normalize_timezone, now_in_tz, today_in_tz
+from config import DB_PATH, all_protected_category_names
 
 PROTECTED_CATEGORY_NAME = "Прочее"
 PROTECTED_CATEGORY_NAMES = all_protected_category_names()

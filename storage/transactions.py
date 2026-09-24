@@ -1,7 +1,20 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for transactions."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from datetime import UTC, datetime
+import json
+import sqlite3
+
+from config import protected_category_name
+from money import MoneyError, as_stored_tiyn
+
+from storage import books, catalog, quota, users
+from storage.conn import (
+    PROTECTED_CATEGORY_NAMES,
+    RECEIPT_TOTAL_MISMATCH_TIYN,
+    TX_REGULAR_TYPES,
+    get_conn,
+)
 
 def add_transaction(
     user_id: int,
@@ -17,15 +30,15 @@ def add_transaction(
 ) -> int:
     if tx_type not in TX_REGULAR_TYPES:
         raise ValueError("Недопустимый тип операции")
-    if not can_write_book(user_id):
+    if not books.can_write_book(user_id):
         raise PermissionError("read-only book")
     actor_id = user_id
-    owner_id = scope_user(user_id)
-    book_id = active_book_id(user_id)
+    owner_id = books.scope_user(user_id)
+    book_id = books.active_book_id(user_id)
     amount_tiyn = as_stored_tiyn(amount)
     with get_conn() as conn:
-        category_id = _owned_category_id(conn, owner_id, category_id)
-        payment_method_id = _owned_payment_id(conn, owner_id, payment_method_id)
+        category_id = catalog._owned_category_id(conn, owner_id, category_id)
+        payment_method_id = catalog._owned_payment_id(conn, owner_id, payment_method_id)
         cur = conn.execute(
             """INSERT INTO transactions(
                    user_id, type, amount, category_id, payment_method_id, store,
@@ -48,7 +61,7 @@ def add_transaction(
                 book_id,
             ),
         )
-        write_audit(
+        books.write_audit(
             book_id, actor_id, "tx_create", "transaction", cur.lastrowid, conn=conn
         )
         return cur.lastrowid
@@ -64,11 +77,11 @@ def save_receipt_draft(
     одновременных нажатия кнопки не смогут оба прочитать один черновик.
     При исключении get_conn откатит шапку, все позиции и удаление черновика.
     """
-    if not can_write_book(user_id):
+    if not books.can_write_book(user_id):
         raise PermissionError("read-only book")
     actor_id = user_id
-    owner_id = scope_user(user_id)
-    book_id = active_book_id(user_id)
+    owner_id = books.scope_user(user_id)
+    book_id = books.active_book_id(user_id)
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -91,7 +104,7 @@ def save_receipt_draft(
         ):
             raise ValueError("Сначала нужно выбрать итог чека")
 
-        payment_method_id = _owned_payment_id(conn, owner_id, parsed.get("payment_method_id"))
+        payment_method_id = catalog._owned_payment_id(conn, owner_id, parsed.get("payment_method_id"))
         if payment_method_id is None:
             payment = conn.execute(
                 """SELECT id FROM payment_methods WHERE user_id=?
@@ -133,7 +146,7 @@ def save_receipt_draft(
                 "SELECT id FROM categories WHERE user_id=? AND name=?",
                 (owner_id, item.get("category") or fallback_name),
             ).fetchone()
-            category_id = category["id"] if category else _owned_category_id(conn, owner_id, None)
+            category_id = category["id"] if category else catalog._owned_category_id(conn, owner_id, None)
             if category_id is not None:
                 touched_categories.add(category_id)
 
@@ -167,8 +180,8 @@ def save_receipt_draft(
         kind = "bank" if parsed.get("source") == "bank_notification" else "photo"
         for fingerprint in parsed.get("fingerprints") or []:
             if isinstance(fingerprint, str) and fingerprint:
-                _remember_fingerprint(conn, owner_id, kind, fingerprint, op_date)
-        write_audit(book_id, actor_id, "receipt_save", "receipt", receipt_id, conn=conn)
+                quota._remember_fingerprint(conn, owner_id, kind, fingerprint, op_date)
+        books.write_audit(book_id, actor_id, "receipt_save", "receipt", receipt_id, conn=conn)
         deleted = conn.execute(
             """DELETE FROM app_state
                WHERE scope='receipt_draft' AND key=? AND user_id=?""",
@@ -262,9 +275,9 @@ def delete_receipt_draft_item(user_id: int, draft_id: str, item_index: int) -> d
 def update_receipt_draft_payment(
     user_id: int, draft_id: str, payment_method_id: int
 ) -> dict | None:
-    owner_id = scope_user(user_id)
+    owner_id = books.scope_user(user_id)
     with get_conn() as conn:
-        owned = _owned_payment_id(conn, owner_id, payment_method_id)
+        owned = catalog._owned_payment_id(conn, owner_id, payment_method_id)
         if owned != payment_method_id:
             return None
         row = conn.execute(
@@ -347,11 +360,11 @@ def resolve_receipt_draft_total(
 
 def _book_clause(actor_id: int, column: str = "book_id") -> tuple[str, tuple]:
     """Условие по активной книге. На личной книге NULL — строки до backfill."""
-    book_id = active_book_id(actor_id)
+    book_id = books.active_book_id(actor_id)
     if not book_id:
         return f"({column} IS NULL)", ()
-    owner = scope_user(actor_id)
-    if book_id == personal_book_id(owner):
+    owner = books.scope_user(actor_id)
+    if book_id == books.personal_book_id(owner):
         return f"({column}=? OR {column} IS NULL)", (book_id,)
     return f"{column}=?", (book_id,)
 
@@ -359,7 +372,7 @@ def _book_clause(actor_id: int, column: str = "book_id") -> tuple[str, tuple]:
 def get_transactions(user_id: int, date_from: str, date_to: str) -> list[sqlite3.Row]:
     """date_from / date_to в формате YYYY-MM-DD, включительно."""
     actor_id = user_id
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     book_sql, book_params = _book_clause(actor_id, "t.book_id")
     with get_conn() as conn:
         return conn.execute(
@@ -375,7 +388,7 @@ def get_transactions(user_id: int, date_from: str, date_to: str) -> list[sqlite3
 
 def get_default_payment_method_id(user_id: int) -> int | None:
     """"Наличные", если есть, иначе первый попавшийся способ оплаты пользователя."""
-    pms = get_payment_methods(user_id)
+    pms = catalog.get_payment_methods(user_id)
     if not pms:
         return None
     default = next((p for p in pms if p["name"] == "Наличные"), pms[0])
@@ -383,7 +396,7 @@ def get_default_payment_method_id(user_id: int) -> int | None:
 
 
 def update_transaction_category(user_id: int, tx_id: int, category_id: int) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
         row = conn.execute(
             "SELECT type FROM transactions WHERE id=? AND user_id=?",
@@ -391,7 +404,7 @@ def update_transaction_category(user_id: int, tx_id: int, category_id: int) -> b
         ).fetchone()
         if not row or row["type"] == "transfer":
             return False
-        owned = _owned_category_id(conn, user_id, category_id)
+        owned = catalog._owned_category_id(conn, user_id, category_id)
         if owned != category_id:
             return False
         cur = conn.execute(
@@ -403,7 +416,7 @@ def update_transaction_category(user_id: int, tx_id: int, category_id: int) -> b
 
 def rename_category(user_id: int, cat_id: int, new_name: str) -> bool:
     """False, если имя занято, это защищённая «Прочее»/Other, или пытаются так назвать другую."""
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     new_name = new_name.strip()
     if not new_name or new_name in PROTECTED_CATEGORY_NAMES:
         return False
@@ -425,7 +438,7 @@ def rename_category(user_id: int, cat_id: int, new_name: str) -> bool:
 
 
 def count_transactions_for_category(user_id: int, cat_id: int) -> int:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS n FROM transactions WHERE user_id=? AND category_id=?",
@@ -438,9 +451,9 @@ def delete_category(user_id: int, cat_id: int, fallback_name: str | None = None)
     """Удаляет категорию, предварительно перенеся все её транзакции в fallback
     (по умолчанию защищённая «Прочее»/Other языка пользователя).
     Отказывает, если удаляют саму fallback-категорию."""
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     if fallback_name is None:
-        fallback_name = protected_category_name(get_user_language(user_id))
+        fallback_name = protected_category_name(users.get_user_language(user_id))
     with get_conn() as conn:
         row = conn.execute(
             "SELECT name FROM categories WHERE id=? AND user_id=?", (cat_id, user_id)
@@ -485,7 +498,7 @@ def delete_category(user_id: int, cat_id: int, fallback_name: str | None = None)
 
 
 def rename_payment_method(user_id: int, pm_id: int, new_name: str) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
         try:
             cur = conn.execute(
@@ -498,7 +511,7 @@ def rename_payment_method(user_id: int, pm_id: int, new_name: str) -> bool:
 
 
 def count_transactions_for_payment_method(user_id: int, pm_id: int) -> int:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS n FROM transactions WHERE user_id=? AND payment_method_id=?",
@@ -511,7 +524,7 @@ def delete_payment_method(user_id: int, pm_id: int) -> bool:
     """Удаляет способ оплаты. У транзакций, где он использовался, payment_method_id
     станет NULL (способ оплаты был не критичен для истории - в отличие от категории,
     отдельного "запасного" способа оплаты не создаём)."""
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
         pms = conn.execute(
             "SELECT id FROM payment_methods WHERE user_id=?", (user_id,)
@@ -550,7 +563,7 @@ def get_recent_transactions(
 ) -> list[sqlite3.Row]:
     """Список операций, новые сверху, с пагинацией и фильтрами в SQL."""
     actor_id = user_id
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     conditions = ["t.user_id=?"]
     params: list = [user_id]
     book_sql, book_params = _book_clause(actor_id, "t.book_id")
@@ -612,7 +625,7 @@ def count_all_transactions(
     tx_type: str | None = None,
 ) -> int:
     actor_id = user_id
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     conditions = ["t.user_id=?"]
     params: list = [user_id]
     book_sql, book_params = _book_clause(actor_id, "t.book_id")
@@ -660,7 +673,7 @@ def count_all_transactions(
 
 def get_transaction_by_id(user_id: int, tx_id: int) -> sqlite3.Row | None:
     actor_id = user_id
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     book_sql, book_params = _book_clause(actor_id, "t.book_id")
     with get_conn() as conn:
         return conn.execute(
@@ -676,7 +689,7 @@ def get_transaction_by_id(user_id: int, tx_id: int) -> sqlite3.Row | None:
 
 
 def update_transaction_amount(user_id: int, tx_id: int, amount) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     amount_tiyn = as_stored_tiyn(amount)
     with get_conn() as conn:
         row = conn.execute(
@@ -694,7 +707,7 @@ def update_transaction_amount(user_id: int, tx_id: int, amount) -> bool:
 
 def update_transaction_date(user_id: int, tx_id: int, op_date: str) -> bool:
     """Обновляет дату только своей операции; принимает ISO YYYY-MM-DD."""
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     try:
         datetime.strptime(op_date, "%Y-%m-%d")
     except (TypeError, ValueError):
@@ -708,7 +721,7 @@ def update_transaction_date(user_id: int, tx_id: int, op_date: str) -> bool:
 
 
 def update_transaction_type(user_id: int, tx_id: int, tx_type: str) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     if tx_type not in TX_REGULAR_TYPES:
         return False
     with get_conn() as conn:
@@ -726,7 +739,7 @@ def update_transaction_type(user_id: int, tx_id: int, tx_type: str) -> bool:
 
 
 def update_transaction_store(user_id: int, tx_id: int, store: str | None) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE transactions SET store=? WHERE id=? AND user_id=?",
@@ -736,7 +749,7 @@ def update_transaction_store(user_id: int, tx_id: int, store: str | None) -> boo
 
 
 def update_transaction_description(user_id: int, tx_id: int, description: str | None) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE transactions SET description=? WHERE id=? AND user_id=?",
@@ -746,9 +759,9 @@ def update_transaction_description(user_id: int, tx_id: int, description: str | 
 
 
 def update_transaction_payment_method(user_id: int, tx_id: int, payment_method_id: int | None) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
-        owned = _owned_payment_id(conn, user_id, payment_method_id)
+        owned = catalog._owned_payment_id(conn, user_id, payment_method_id)
         if payment_method_id is not None and owned != payment_method_id:
             return False
         cur = conn.execute(
@@ -772,7 +785,7 @@ def update_transaction_fields(
 ) -> bool:
     """Одна транзакция БД на все поля карточки. Transfer не трогаем."""
     actor_id = user_id
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     if tx_type not in TX_REGULAR_TYPES:
         return False
     try:
@@ -789,10 +802,10 @@ def update_transaction_fields(
         ).fetchone()
         if not row or row["type"] == "transfer":
             return False
-        owned_cat = _owned_category_id(conn, user_id, category_id)
+        owned_cat = catalog._owned_category_id(conn, user_id, category_id)
         if owned_cat != category_id:
             return False
-        owned_pay = _owned_payment_id(conn, user_id, payment_method_id)
+        owned_pay = catalog._owned_payment_id(conn, user_id, payment_method_id)
         if payment_method_id is not None and owned_pay != payment_method_id:
             return False
         cur = conn.execute(
@@ -818,7 +831,7 @@ def update_transaction_fields(
 
 def delete_transaction(user_id: int, tx_id: int) -> bool:
     actor_id = user_id
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     book_sql, book_params = _book_clause(actor_id, "book_id")
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")

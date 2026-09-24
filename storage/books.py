@@ -1,7 +1,21 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for books."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from datetime import UTC, datetime, timedelta
+import secrets
+import sqlite3
+
+from config import (
+    BOOK_INVITE_HOURS,
+    GEMINI_DAILY_LIMIT,
+    GEMINI_PRO_LIMIT,
+    PLAN_FREE,
+    PLAN_PRO,
+    PRO_DURATION_DAYS,
+)
+
+from storage import state
+from storage.conn import get_conn
 
 # ---------------------------------------------------------------------------
 # Семейная книга, тарифы, здоровье планировщиков
@@ -399,7 +413,7 @@ def refund_stars_payment(payment_id: str) -> bool:
 
 
 def touch_scheduler(name: str) -> None:
-    save_state(
+    state.save_state(
         "scheduler",
         name,
         {"ts": datetime.now(UTC).isoformat()},
@@ -411,7 +425,7 @@ def scheduler_health() -> dict:
     items: dict[str, dict] = {}
     stale = False
     for name, interval in SCHEDULER_INTERVALS.items():
-        payload = load_state("scheduler", name, {})
+        payload = state.load_state("scheduler", name, {})
         ts = payload.get("ts") if isinstance(payload, dict) else None
         if not ts:
             items[name] = {"ok": True, "age_sec": None, "status": "unknown"}

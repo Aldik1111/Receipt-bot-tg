@@ -1,22 +1,28 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for recurring."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from datetime import UTC, datetime
+import sqlite3
+
+from money import as_stored_tiyn
+
+from storage import books, catalog, transactions
+from storage.conn import TX_REGULAR_TYPES, get_conn
 
 def add_recurring(
     user_id: int, tx_type: str, amount, category_id: int | None,
     payment_method_id: int | None, description: str, day_of_month: int,
 ) -> int:
-    book_id = active_book_id(user_id)
-    user_id = _require_write(user_id)
+    book_id = books.active_book_id(user_id)
+    user_id = books._require_write(user_id)
     if tx_type not in TX_REGULAR_TYPES:
         raise ValueError("Недопустимый тип повтора")
     if not (1 <= int(day_of_month) <= 28):
         raise ValueError("День повтора должен быть 1–28")
     amount_tiyn = as_stored_tiyn(amount)
     with get_conn() as conn:
-        category_id = _owned_category_id(conn, user_id, category_id)
-        payment_method_id = _owned_payment_id(conn, user_id, payment_method_id)
+        category_id = catalog._owned_category_id(conn, user_id, category_id)
+        payment_method_id = catalog._owned_payment_id(conn, user_id, payment_method_id)
         cur = conn.execute(
             """INSERT INTO recurring_payments
                (user_id, type, amount, category_id, payment_method_id, description,
@@ -32,8 +38,8 @@ def add_recurring(
 
 def get_recurring_list(user_id: int) -> list[sqlite3.Row]:
     actor_id = user_id
-    user_id = scope_user(user_id)
-    book_sql, book_params = _book_clause(actor_id, "r.book_id")
+    user_id = books.scope_user(user_id)
+    book_sql, book_params = transactions._book_clause(actor_id, "r.book_id")
     with get_conn() as conn:
         return conn.execute(
             f"""SELECT r.*, c.name AS category_name, c.emoji AS category_emoji, p.name AS payment_name
@@ -46,7 +52,7 @@ def get_recurring_list(user_id: int) -> list[sqlite3.Row]:
 
 
 def get_recurring_by_id(user_id: int, rec_id: int) -> sqlite3.Row | None:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         return conn.execute(
             """SELECT r.*, c.name AS category_name, c.emoji AS category_emoji, p.name AS payment_name
@@ -70,7 +76,7 @@ def update_recurring(
     tx_type: str | None = None,
 ) -> bool:
     """Меняет поля правила. recurring_runs не трогает — уже прошедшие периоды остаются."""
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     if tx_type is not None and tx_type not in TX_REGULAR_TYPES:
         return False
     if day_of_month is not None and not (1 <= int(day_of_month) <= 28):
@@ -91,13 +97,13 @@ def update_recurring(
             updates.append("day_of_month=?")
             params.append(int(day_of_month))
         if category_id is not None:
-            owned = _owned_category_id(conn, user_id, category_id)
+            owned = catalog._owned_category_id(conn, user_id, category_id)
             if owned != category_id:
                 return False
             updates.append("category_id=?")
             params.append(owned)
         if payment_method_id is not None:
-            owned_pay = _owned_payment_id(conn, user_id, payment_method_id)
+            owned_pay = catalog._owned_payment_id(conn, user_id, payment_method_id)
             if owned_pay != payment_method_id:
                 return False
             updates.append("payment_method_id=?")
@@ -122,7 +128,7 @@ def update_recurring(
 
 
 def delete_recurring(user_id: int, rec_id: int) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
         conn.execute("DELETE FROM recurring_runs WHERE recurring_id=?", (rec_id,))
         cur = conn.execute(
@@ -132,7 +138,7 @@ def delete_recurring(user_id: int, rec_id: int) -> bool:
 
 
 def toggle_recurring_active(user_id: int, rec_id: int) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE recurring_payments SET active = 1 - active WHERE id=? AND user_id=?",

@@ -1,55 +1,245 @@
-"""
-Слой работы с базой данных (SQLite). Фасад пакета storage: handlers и тесты
-по-прежнему делают `import db`.
-"""
+"""Backward-compatible public facade for the explicitly connected storage modules."""
 
-from storage import (  # noqa: F401
-    backup,
-    books,
-    budgets,
-    catalog,
-    conn,
-    goals,
-    quota,
-    recurring,
-    schema,
-    state,
-    transactions,
-    users,
-    wipe,
+from storage.backup import (  # noqa: F401
+    get_all_user_rows,
+    restore_user_backup,
 )
-
-_MODULES = (
-    conn,
-    schema,
-    catalog,
-    transactions,
-    recurring,
-    budgets,
-    goals,
-    users,
-    quota,
-    state,
-    wipe,
-    backup,
-    books,
+from storage.books import (  # noqa: F401
+    SCHEDULER_INTERVALS,
+    _grant_pro_on_conn,
+    _plan_is_active,
+    _require_write,
+    active_book_id,
+    book_role,
+    can_write_book,
+    create_book_invite,
+    gemini_daily_limit,
+    grant_pro,
+    is_pro,
+    join_book_invite,
+    leave_active_book,
+    list_book_members,
+    list_user_books,
+    personal_book_id,
+    record_stars_payment,
+    refund_stars_payment,
+    revoke_pro,
+    scheduler_health,
+    scope_user,
+    switch_active_book,
+    touch_scheduler,
+    user_plan_info,
+    write_audit,
 )
-
-
-def _export_all() -> None:
-    for mod in _MODULES:
-        for name in dir(mod):
-            if name.startswith("__"):
-                continue
-            globals()[name] = getattr(mod, name)
-
-
-def _wire_storage() -> None:
-    exported = {key: value for key, value in globals().items() if not key.startswith("__")}
-    for mod in _MODULES:
-        for key, value in exported.items():
-            setattr(mod, key, value)
-
-
-_export_all()
-_wire_storage()
+from storage.budgets import (  # noqa: F401
+    delete_budget,
+    get_budget_by_id,
+    get_budget_for_category,
+    get_budgets,
+    get_category_spent,
+    get_goal_transfers_total,
+    get_goals_reserved,
+    get_overall_budget,
+    get_total_expense,
+    set_budget,
+)
+from storage.catalog import (  # noqa: F401
+    _owned_category_id,
+    _owned_payment_id,
+    _seed_default_catalog,
+    add_category,
+    add_payment_method,
+    ensure_user,
+    get_categories,
+    get_category_id_by_name,
+    get_payment_method_id_by_name,
+    get_payment_methods,
+    maybe_reseed_default_catalog,
+)
+from storage.conn import (  # noqa: F401
+    BACKUP_VERSION,
+    BOOKS_SCHEMA_KEY,
+    BOOK_ROLES,
+    GOALS_SCHEMA_KEY,
+    MONEY_TIYN_KEY,
+    PROTECTED_CATEGORY_NAME,
+    PROTECTED_CATEGORY_NAMES,
+    RECEIPT_TOTAL_MISMATCH_TIYN,
+    SAVINGS_CATEGORY_EMOJI,
+    SAVINGS_CATEGORY_NAME,
+    TX_ALL_TYPES,
+    TX_REGULAR_TYPES,
+    _active_db_path,
+    _column_names,
+    _column_notnull,
+    _column_type,
+    _ensure_budget_indexes,
+    _ensure_column,
+    _ensure_tx_indexes,
+    _table_sql,
+    get_conn,
+)
+from storage.goals import (  # noqa: F401
+    _default_payment_id,
+    _ensure_savings_category,
+    _insert_goal_transfer,
+    _parse_iso_date,
+    contribute_to_goal,
+    create_goal,
+    delete_goal,
+    get_category_name,
+    get_goal_by_id,
+    get_goals,
+    update_goal,
+    withdraw_from_goal,
+)
+from storage.quota import (  # noqa: F401
+    _remember_fingerprint,
+    count_import_duplicates,
+    find_fingerprint,
+    get_gemini_quota_used,
+    get_gemini_usage_total,
+    refund_gemini_quota,
+    try_consume_gemini_quota,
+)
+from storage.recurring import (  # noqa: F401
+    add_recurring,
+    apply_due_recurring,
+    delete_recurring,
+    get_all_active_recurring,
+    get_recurring_by_id,
+    get_recurring_list,
+    toggle_recurring_active,
+    update_recurring,
+)
+from storage.schema import (  # noqa: F401
+    _create_personal_book,
+    _migrate_family_billing,
+    _migrate_goals_transfers_and_overall_budget,
+    _migrate_money_to_tiyn,
+    _money_totals,
+    _rebuild_table,
+    _scale_legacy_tenge_columns,
+    init_db,
+)
+from storage.state import (  # noqa: F401
+    commit_import_draft,
+    delete_state,
+    get_transactions_by_receipt,
+    load_state,
+    pop_state,
+    purge_stale_state,
+    save_state,
+)
+from storage.transactions import (  # noqa: F401
+    _book_clause,
+    _mutate_receipt_draft,
+    add_transaction,
+    count_all_transactions,
+    count_transactions_for_category,
+    count_transactions_for_payment_method,
+    delete_category,
+    delete_payment_method,
+    delete_receipt_draft_item,
+    delete_transaction,
+    get_default_payment_method_id,
+    get_receipt_draft,
+    get_recent_transactions,
+    get_transaction_by_id,
+    get_transactions,
+    rename_category,
+    rename_payment_method,
+    resolve_receipt_draft_total,
+    save_receipt_draft,
+    update_receipt_draft_item,
+    update_receipt_draft_payment,
+    update_receipt_draft_type,
+    update_transaction_amount,
+    update_transaction_category,
+    update_transaction_date,
+    update_transaction_description,
+    update_transaction_fields,
+    update_transaction_payment_method,
+    update_transaction_store,
+    update_transaction_type,
+)
+from storage.users import (  # noqa: F401
+    accept_privacy_policy,
+    get_digest_frequency,
+    get_learned_category_name,
+    get_privacy_accepted_version,
+    get_settings,
+    get_user_language,
+    get_user_timezone,
+    get_users_bank_import_enabled,
+    get_users_for_backup,
+    get_users_for_digest,
+    get_users_for_idle_check,
+    is_onboarded,
+    learn_category,
+    mark_backup_sent,
+    mark_digest_sent,
+    mark_idle_reminder_sent,
+    mark_onboarded,
+    set_backup_enabled,
+    set_bank_import_enabled,
+    set_category_emoji,
+    set_digest_frequency,
+    set_idle_reminder_enabled,
+    set_user_language,
+    set_user_timezone,
+    touch_activity,
+    user_now,
+    user_today,
+)
+from storage.wipe import (  # noqa: F401
+    _user_owns_book,
+    _wipe_user_books,
+    _wipe_user_finance,
+    count_user_data,
+    delete_all_user_data,
+    list_owned_book_member_ids,
+)
+from config import (  # noqa: F401
+    BOOK_INVITE_HOURS,
+    DB_PATH,
+    DEFAULT_CATEGORIES,
+    DEFAULT_CATEGORY_EMOJIS,
+    DEFAULT_PAYMENT_METHODS,
+    DEFAULT_PAYMENT_METHODS_I18N,
+    GEMINI_DAILY_LIMIT,
+    GEMINI_PRO_LIMIT,
+    PLAN_FREE,
+    PLAN_PRO,
+    PRO_DURATION_DAYS,
+    all_protected_category_names,
+    default_categories_for,
+    default_emojis_for,
+    protected_category_name,
+)
+from contextlib import (  # noqa: F401
+    contextmanager,
+)
+from datetime import (  # noqa: F401
+    UTC,
+    date,
+    datetime,
+    timedelta,
+)
+from fingerprints import (  # noqa: F401
+    import_row_fingerprint,
+)
+from money import (  # noqa: F401
+    MoneyError,
+    as_stored_tiyn,
+    backup_amount_to_tiyn,
+    backup_signed_amount_to_tiyn,
+)
+from timeutil import (  # noqa: F401
+    DEFAULT_TIMEZONE,
+    TIMEZONE_CHOICES,
+    normalize_timezone,
+    now_in_tz,
+    today_in_tz,
+)
+from storage.reporting import get_category_totals, get_summary_totals  # noqa: F401

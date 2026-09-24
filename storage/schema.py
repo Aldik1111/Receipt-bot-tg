@@ -1,7 +1,26 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for schema."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from datetime import UTC, datetime
+import json
+
+from config import PLAN_FREE
+from money import backup_amount_to_tiyn
+from timeutil import DEFAULT_TIMEZONE
+
+from storage.conn import (
+    BOOKS_SCHEMA_KEY,
+    GOALS_SCHEMA_KEY,
+    MONEY_TIYN_KEY,
+    _column_names,
+    _column_notnull,
+    _column_type,
+    _ensure_budget_indexes,
+    _ensure_column,
+    _ensure_tx_indexes,
+    _table_sql,
+    get_conn,
+)
 
 def _money_totals(conn) -> dict:
     def scalar(sql: str):

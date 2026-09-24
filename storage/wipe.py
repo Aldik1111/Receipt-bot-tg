@@ -1,7 +1,8 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for wipe."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from storage import schema
+from storage.conn import get_conn
 
 # ---------------------------------------------------------------------------
 # Полное удаление данных пользователя (опасная зона)
@@ -81,7 +82,7 @@ def _wipe_user_finance(
         conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
         return
     if wipe_books or not _user_owns_book(conn, user_id):
-        _create_personal_book(conn, user_id)
+        schema._create_personal_book(conn, user_id)
 
 
 def list_owned_book_member_ids(user_id: int) -> list[int]:

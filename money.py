@@ -61,6 +61,12 @@ def tenge_to_tiyn(value) -> int:
     amount = _as_decimal(value)
     if amount <= 0:
         raise MoneyError("amount must be positive")
+    # Reject extreme exponents before Decimal multiplication/quantization.
+    # Leave one tiyn of headroom so the existing rounding boundary is preserved.
+    if amount >= Decimal(MAX_TIYN + 1) / TIYN_PER_TENGE:
+        raise MoneyError("amount too large")
+    if amount < Decimal("0.005"):
+        raise MoneyError("amount rounds to zero")
     tiyn = int((amount * TIYN_PER_TENGE).quantize(_TIYN_QUANT, rounding=ROUND_HALF_UP))
     return _require_tiyn_range(tiyn)
 

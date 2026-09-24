@@ -1,7 +1,19 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for catalog."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from datetime import UTC, datetime
+import sqlite3
+
+from config import (
+    DEFAULT_PAYMENT_METHODS,
+    DEFAULT_PAYMENT_METHODS_I18N,
+    default_categories_for,
+    default_emojis_for,
+    protected_category_name,
+)
+
+from storage import books, schema, users, wipe
+from storage.conn import PROTECTED_CATEGORY_NAMES, get_conn
 
 def ensure_user(user_id: int, username: str | None, language: str | None = None):
     """Создаёт пользователя и его дефолтные категории/способы оплаты, если его ещё нет."""
@@ -9,6 +21,12 @@ def ensure_user(user_id: int, username: str | None, language: str | None = None)
 
     lang = normalize_lang(language) if language else "ru"
     with get_conn() as conn:
+        row = conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if row:
+            return
+        # Serialize first-time setup, then recheck after any competing creator commits.
+        # Existing users keep the read-only path above.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone()
         if row:
             return
@@ -20,7 +38,7 @@ def ensure_user(user_id: int, username: str | None, language: str | None = None)
             (user_id, username, datetime.now(UTC).isoformat(), 0, 0, lang),
         )
         _seed_default_catalog(conn, user_id, lang)
-        _create_personal_book(conn, user_id)
+        schema._create_personal_book(conn, user_id)
 
 
 def _seed_default_catalog(conn, user_id: int, lang: str) -> None:
@@ -39,7 +57,7 @@ def _seed_default_catalog(conn, user_id: int, lang: str) -> None:
 
 def maybe_reseed_default_catalog(user_id: int, lang: str) -> None:
     """На онбординге меняет дефолтный каталог под язык, если ещё нет операций."""
-    if is_onboarded(user_id) or count_user_data(user_id) > 0:
+    if users.is_onboarded(user_id) or wipe.count_user_data(user_id) > 0:
         return
     known = set()
     for pack_lang in ("ru", "en", "kk"):
@@ -67,7 +85,7 @@ def maybe_reseed_default_catalog(user_id: int, lang: str) -> None:
 
 
 def get_categories(user_id: int) -> list[sqlite3.Row]:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM categories WHERE user_id=? ORDER BY name", (user_id,)
@@ -75,7 +93,7 @@ def get_categories(user_id: int) -> list[sqlite3.Row]:
 
 
 def add_category(user_id: int, name: str, emoji: str = "🏷") -> int:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     name = name.strip()[:64]
     emoji = (emoji or "🏷")[:16]
     with get_conn() as conn:
@@ -90,7 +108,7 @@ def add_category(user_id: int, name: str, emoji: str = "🏷") -> int:
 
 
 def get_category_id_by_name(user_id: int, name: str) -> int | None:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id FROM categories WHERE user_id=? AND name=?", (user_id, name)
@@ -99,7 +117,7 @@ def get_category_id_by_name(user_id: int, name: str) -> int | None:
 
 
 def get_payment_method_id_by_name(user_id: int, name: str) -> int | None:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id FROM payment_methods WHERE user_id=? AND name=?", (user_id, name)
@@ -108,7 +126,7 @@ def get_payment_method_id_by_name(user_id: int, name: str) -> int | None:
 
 
 def get_payment_methods(user_id: int) -> list[sqlite3.Row]:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM payment_methods WHERE user_id=? ORDER BY name", (user_id,)
@@ -116,7 +134,7 @@ def get_payment_methods(user_id: int) -> list[sqlite3.Row]:
 
 
 def add_payment_method(user_id: int, name: str) -> int:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     name = name.strip()[:64]
     with get_conn() as conn:
         conn.execute(

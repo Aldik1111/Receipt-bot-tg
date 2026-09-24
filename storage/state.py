@@ -1,7 +1,15 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for state."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from datetime import UTC, datetime, timedelta
+import json
+import sqlite3
+
+from fingerprints import import_row_fingerprint
+from money import as_stored_tiyn
+
+from storage import books, catalog, quota, transactions
+from storage.conn import TX_ALL_TYPES, get_conn
 
 # ---------------------------------------------------------------------------
 # Временное состояние диалога (черновики, шаг FSM, позиция в списке)
@@ -76,7 +84,7 @@ def commit_import_draft(
                 (import_id, user_id),
             )
             return 0
-        payment_method_id = _owned_payment_id(conn, user_id, payment_method_id)
+        payment_method_id = catalog._owned_payment_id(conn, user_id, payment_method_id)
         now = datetime.now(UTC).isoformat()
         for item in rows:
             tx_type = item.get("type", "expense")
@@ -90,7 +98,7 @@ def commit_import_draft(
                     (user_id, cat_name),
                 ).fetchone()
                 category_id = cat["id"] if cat else None
-            category_id = _owned_category_id(conn, user_id, category_id)
+            category_id = catalog._owned_category_id(conn, user_id, category_id)
 
             # Способ оплаты из файла берём только если такой уже есть у
             # пользователя: импорт не должен молча плодить новые карты.
@@ -122,7 +130,7 @@ def commit_import_draft(
                     now,
                 ),
             )
-            _remember_fingerprint(
+            quota._remember_fingerprint(
                 conn,
                 user_id,
                 "import",
@@ -166,8 +174,8 @@ def get_transactions_by_receipt(user_id: int, receipt_id: int) -> list[sqlite3.R
     """Позиции конкретного чека. Заменяет словарь в памяти: связь товара с
     чеком и так хранится в transactions.receipt_id."""
     actor_id = user_id
-    user_id = scope_user(user_id)
-    book_sql, book_params = _book_clause(actor_id, "t.book_id")
+    user_id = books.scope_user(user_id)
+    book_sql, book_params = transactions._book_clause(actor_id, "t.book_id")
     with get_conn() as conn:
         return conn.execute(
             f"""SELECT t.*, c.name AS category_name, c.emoji AS category_emoji, p.name AS payment_name

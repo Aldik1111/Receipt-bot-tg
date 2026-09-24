@@ -1,7 +1,13 @@
-"""Фрагмент слоя БД. Имена соседних модулей подставляются из фасада db.py."""
+"""SQLite persistence operations for goals."""
 from __future__ import annotations
 
-from storage.conn import *  # noqa: F403
+from datetime import UTC, datetime
+import sqlite3
+
+from money import MoneyError, as_stored_tiyn
+
+from storage import books, catalog, users
+from storage.conn import SAVINGS_CATEGORY_EMOJI, SAVINGS_CATEGORY_NAME, get_conn
 
 # ---------------------------------------------------------------------------
 # Накопительные цели
@@ -51,7 +57,7 @@ def _insert_goal_transfer(
     payment_method_id: int | None,
 ) -> int:
     category_id = _ensure_savings_category(conn, user_id)
-    pay_id = _owned_payment_id(conn, user_id, payment_method_id) or _default_payment_id(conn, user_id)
+    pay_id = catalog._owned_payment_id(conn, user_id, payment_method_id) or _default_payment_id(conn, user_id)
     verb = "Пополнение цели" if goal_delta > 0 else "Снятие с цели"
     cur = conn.execute(
         """INSERT INTO transactions(
@@ -78,7 +84,7 @@ def _insert_goal_transfer(
 
 
 def create_goal(user_id: int, name: str, target_amount, deadline: str | None = None) -> int:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     name = name.strip()[:64]
     target_tiyn = as_stored_tiyn(target_amount)
     deadline = _parse_iso_date(deadline)
@@ -93,7 +99,7 @@ def create_goal(user_id: int, name: str, target_amount, deadline: str | None = N
 
 
 def get_goals(user_id: int) -> list[sqlite3.Row]:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM savings_goals WHERE user_id=? ORDER BY created_at", (user_id,)
@@ -101,7 +107,7 @@ def get_goals(user_id: int) -> list[sqlite3.Row]:
 
 
 def get_goal_by_id(user_id: int, goal_id: int) -> sqlite3.Row | None:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM savings_goals WHERE id=? AND user_id=?", (goal_id, user_id)
@@ -117,7 +123,7 @@ def update_goal(
     deadline: str | None = None,
     clear_deadline: bool = False,
 ) -> bool:
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id FROM savings_goals WHERE id=? AND user_id=?",
@@ -163,9 +169,9 @@ def contribute_to_goal(
     payment_method_id: int | None = None,
 ) -> int | None:
     """Пополнение: перевод + прогресс в одной транзакции БД. Возвращает id операции."""
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     amount_tiyn = as_stored_tiyn(amount)
-    op_date = op_date or user_today(user_id).isoformat()
+    op_date = op_date or users.user_today(user_id).isoformat()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         goal = conn.execute(
@@ -192,12 +198,12 @@ def withdraw_from_goal(
     payment_method_id: int | None = None,
 ) -> tuple[int | None, str]:
     """Снятие с цели. Не даёт уйти в минус. (tx_id, 'ok') или (None, причина)."""
-    user_id = _require_write(user_id)
+    user_id = books._require_write(user_id)
     try:
         amount_tiyn = as_stored_tiyn(amount)
     except MoneyError:
         return None, "bad_amount"
-    op_date = op_date or user_today(user_id).isoformat()
+    op_date = op_date or users.user_today(user_id).isoformat()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         goal = conn.execute(
@@ -223,8 +229,8 @@ def withdraw_from_goal(
 
 def delete_goal(user_id: int, goal_id: int) -> bool:
     """Удаляет цель. Остаток возвращается переводом, история операций сохраняется."""
-    user_id = _require_write(user_id)
-    op_date = user_today(user_id).isoformat()
+    user_id = books._require_write(user_id)
+    op_date = users.user_today(user_id).isoformat()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         goal = conn.execute(
@@ -245,7 +251,7 @@ def delete_goal(user_id: int, goal_id: int) -> bool:
 
 
 def get_category_name(user_id: int, category_id: int) -> str | None:
-    user_id = scope_user(user_id)
+    user_id = books.scope_user(user_id)
     with get_conn() as conn:
         row = conn.execute(
             "SELECT name FROM categories WHERE id=? AND user_id=?", (category_id, user_id)
