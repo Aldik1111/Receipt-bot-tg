@@ -6,14 +6,28 @@ try:
 except ImportError:
     pass  # python-dotenv не обязателен - можно просто экспортировать переменные в shell
 
+
+def _env(name: str, default: str = "") -> str:
+    """Читает .env без кавычек и хвоста вида ` # комментарий`."""
+    raw = os.getenv(name, default)
+    if raw is None:
+        raw = default
+    text = str(raw).strip()
+    if " #" in text:
+        text = text.split(" #", 1)[0].rstrip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text
+
+
 # Токен бота берём из переменной окружения (получить у @BotFather в Telegram)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = _env("BOT_TOKEN")
 
 # Публичный HTTPS-адрес Mini App (без завершающего слэша).
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")
 
 # Версия политики, которую пользователь принимает в /start и /privacy.
-PRIVACY_POLICY_VERSION = os.getenv("PRIVACY_POLICY_VERSION", "2026-08-20")
+PRIVACY_POLICY_VERSION = os.getenv("PRIVACY_POLICY_VERSION", "2026-09-15")
 
 # Путь к файлу базы данных SQLite
 DB_PATH = os.getenv("DB_PATH", "budget.db")
@@ -77,17 +91,85 @@ DEFAULT_CATEGORY_EMOJIS = {
 
 DEFAULT_PAYMENT_METHODS = ["Наличные", "Карта (основная)"]
 
+DEFAULT_CATEGORY_NAMES = {
+    "ru": list(DEFAULT_CATEGORIES.keys()),
+    "en": [
+        "Groceries",
+        "Cafes and restaurants",
+        "Transport",
+        "Clothes and shoes",
+        "Health and pharmacy",
+        "Entertainment",
+        "Utilities and comms",
+        "Home",
+        "Other",
+    ],
+    "kk": [
+        "Азық-түлік",
+        "Кафе мен мейрамханалар",
+        "Көлік",
+        "Киім мен аяқ киім",
+        "Денсаулық пен дәріхана",
+        "Ойын-сауық",
+        "Коммуналдық және байланыс",
+        "Үй",
+        "Басқа",
+    ],
+}
+
+DEFAULT_PAYMENT_METHODS_I18N = {
+    "ru": ["Наличные", "Карта (основная)"],
+    "en": ["Cash", "Card (main)"],
+    "kk": ["Қолма-қол", "Карта (негізгі)"],
+}
+
+
+def default_categories_for(lang: str) -> dict[str, list[str]]:
+    names = DEFAULT_CATEGORY_NAMES.get(lang) or DEFAULT_CATEGORY_NAMES["ru"]
+    return {
+        names[index]: keywords
+        for index, (_ru, keywords) in enumerate(DEFAULT_CATEGORIES.items())
+    }
+
+
+def default_emojis_for(lang: str) -> dict[str, str]:
+    names = DEFAULT_CATEGORY_NAMES.get(lang) or DEFAULT_CATEGORY_NAMES["ru"]
+    ru_names = list(DEFAULT_CATEGORIES.keys())
+    return {
+        names[index]: DEFAULT_CATEGORY_EMOJIS[ru_names[index]]
+        for index in range(len(ru_names))
+    }
+
+
+def protected_category_name(lang: str = "ru") -> str:
+    names = DEFAULT_CATEGORY_NAMES.get(lang) or DEFAULT_CATEGORY_NAMES["ru"]
+    return names[-1]
+
+
+def all_protected_category_names() -> frozenset[str]:
+    return frozenset(names[-1] for names in DEFAULT_CATEGORY_NAMES.values())
+
+
+def localize_default_category(ru_name: str, lang: str) -> str:
+    ru_names = list(DEFAULT_CATEGORIES.keys())
+    try:
+        index = ru_names.index(ru_name)
+    except ValueError:
+        return ru_name
+    names = DEFAULT_CATEGORY_NAMES.get(lang) or ru_names
+    return names[index]
+
 # Валюта фиксирована - тенге. Символ используется во всех местах, где
 # показывается сумма (см. formatting.py)
 CURRENCY_SYMBOL = "₸"
 
 # Google Gemini - единственный способ распознавания чека.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY = _env("GEMINI_API_KEY")
 # Название модели-алиаса - Google сам направляет его на актуальную Flash-модель,
 # поэтому имя не "протухнет" при выходе новых версий (в отличие от жёстко
 # зашитого "gemini-2.5-flash", который в какой-то момент может быть снят с
 # поддержки). Полный список: https://ai.google.dev/gemini-api/docs/models
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-flash-latest")
 
 # Твой Telegram user_id - сюда будет приходить фидбэк от /feedback.
 # Узнать свой id можно у бота @userinfobot.

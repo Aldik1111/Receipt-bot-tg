@@ -206,31 +206,26 @@ class BreakageTests(unittest.TestCase):
         self.assertEqual(int(goal["current_amount"]), 0)
 
     def test_gemini_quota_refunds_on_api_failure_not_empty_receipt(self):
-        from handlers.receipt import _recognize_receipt_image
+        from receipt_pipeline import extract_receipt
         from unittest.mock import patch
 
-        day = "2026-09-05"
+        day = db.user_today(1).isoformat()
         with patch(
-            "handlers.receipt.prepare_receipt_image",
-            return_value=str(Path(self.tempdir.name) / "prep.jpg"),
-        ), patch("handlers.receipt.sha256_file", return_value="abc"), patch(
-            "handlers.receipt.extract_receipt",
+            "receipt_pipeline.get_receipt_from_gemini",
             return_value=(None, "network"),
         ):
-            Path(self.tempdir.name, "prep.jpg").write_bytes(b"x")
-            result = _recognize_receipt_image(1, "src.jpg", day, "uid")
-        self.assertEqual(result["error"], "network")
+            parsed, err = extract_receipt("src.jpg", 1)
+        self.assertEqual(err, "network")
+        self.assertEqual(parsed["items"], [])
         self.assertEqual(db.get_gemini_quota_used(1, day), 0)
 
         with patch(
-            "handlers.receipt.prepare_receipt_image",
-            return_value=str(Path(self.tempdir.name) / "prep.jpg"),
-        ), patch("handlers.receipt.sha256_file", return_value="abc"), patch(
-            "handlers.receipt.extract_receipt",
-            return_value=({"items": []}, "empty"),
+            "receipt_pipeline.get_receipt_from_gemini",
+            return_value=(None, "empty"),
         ):
-            result = _recognize_receipt_image(1, "src.jpg", day, "uid")
-        self.assertEqual(result["error"], "empty")
+            parsed, err = extract_receipt("src.jpg", 1)
+        self.assertEqual(err, "empty")
+        self.assertEqual(parsed["items"], [])
         self.assertEqual(db.get_gemini_quota_used(1, day), 1)
 
     def test_backup_v2_tenge_payload_still_restores(self):

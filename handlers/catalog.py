@@ -1,59 +1,27 @@
-import asyncio
-import io
-import json
 import logging
-import os
-import re
-import tempfile
-import uuid
-from collections import defaultdict
-from datetime import date, datetime, timedelta
 
-from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramRetryAfter
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import (
-    BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, Message,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-import backup
-import bank_import
-import charts
+from config import all_protected_category_names, protected_category_name
+from formatting import hx, is_single_emoji
+from handlers.common import text_hint, CategoryEntry, PaymentEntry
+from i18n import t
+from keyboards.common import with_back_button
 import db
-import export
-from categorizer import categorize, categorize_many, categorize_smart
-from config import ADMIN_USER_ID, GEMINI_DAILY_LIMIT
-from fingerprints import (
-    bank_fingerprint, photo_sha256_fingerprint, photo_telegram_fingerprint,
-)
-from formatting import hx, is_single_emoji, money, parse_positive_amount
-from gemini_engine import generate_insight_text
-from i18n import LANGUAGES, t
-from image_prep import (
-    MAX_RECEIPT_BYTES, ReceiptImageError, prepare_receipt_image, sha256_file,
-)
-from money import tiyn_to_tenge
-from receipt_pipeline import extract_receipt
-from timeutil import TIMEZONE_CHOICES
-
-from handlers.common import *
-from keyboards.common import (
-    categories_keyboard, payments_keyboard, period_keyboard, with_back_button,
-)
 
 _with_back_button = with_back_button
 logger = logging.getLogger(__name__)
 
-
-
-
-router = Router(name="catalog")
-
-PROTECTED_CATEGORY = "Прочее"
+router = Router(name='catalog')
+PROTECTED_NAMES = all_protected_category_names()
 CATALOG_PAGE_SIZE = 8
 
+
+def _protected_name(user_id: int) -> str:
+    return protected_category_name(db.get_user_language(user_id))
 
 def _categories_view(
     user_id: int,
@@ -70,7 +38,7 @@ def _categories_view(
 
     buttons = []
     for c in visible:
-        if c["name"] == PROTECTED_CATEGORY:
+        if c["name"] in PROTECTED_NAMES:
             buttons.append([InlineKeyboardButton(text=f"{c['emoji']} {c['name']} 🔒", callback_data="noop")])
         else:
             buttons.append([
@@ -133,7 +101,7 @@ async def add_category_name(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("cat_edit:"))
 async def cat_edit_start(callback: CallbackQuery, state: FSMContext):
     cat_id = int(callback.data.split(":", 1)[1])
-    if db.get_category_name(callback.from_user.id, cat_id) == PROTECTED_CATEGORY:
+    if db.get_category_name(callback.from_user.id, cat_id) in PROTECTED_NAMES:
         await callback.answer(t("protected_rename", db.get_user_language(callback.from_user.id)), show_alert=True)
         return
     await state.update_data(edit_cat_id=cat_id)
@@ -187,7 +155,7 @@ async def cat_delete_confirm(callback: CallbackQuery):
     cat_id = int(callback.data.split(":", 1)[1])
     count = db.count_transactions_for_category(callback.from_user.id, cat_id)
     note = (
-        t("category_has_tx", lang, count=count, fallback=PROTECTED_CATEGORY)
+        t("category_has_tx", lang, count=count, fallback=_protected_name(callback.from_user.id))
         if count
         else t("category_no_tx", lang)
     )
@@ -205,7 +173,11 @@ async def cat_delete_confirm(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("cat_del_yes:"))
 async def cat_delete_apply(callback: CallbackQuery):
     cat_id = int(callback.data.split(":", 1)[1])
-    ok = db.delete_category(callback.from_user.id, cat_id, fallback_name=PROTECTED_CATEGORY)
+    ok = db.delete_category(
+        callback.from_user.id,
+        cat_id,
+        fallback_name=_protected_name(callback.from_user.id),
+    )
     lang = db.get_user_language(callback.from_user.id)
     text, keyboard = _categories_view(callback.from_user.id)
     key = "deleted" if ok else "delete_failed"

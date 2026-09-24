@@ -1,67 +1,29 @@
 import asyncio
-import io
-import json
 import logging
-import os
 import re
-import tempfile
-import uuid
-from collections import defaultdict
-from datetime import date, datetime, timedelta
 
-from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramRetryAfter
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram import F, Router
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import (
-    BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, Message,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-import backup
-import bank_import
-import charts
-import db
-import export
-from categorizer import categorize, categorize_many, categorize_smart
-from config import ADMIN_USER_ID, GEMINI_DAILY_LIMIT
-from fingerprints import (
-    bank_fingerprint, photo_sha256_fingerprint, photo_telegram_fingerprint,
-)
+from categorizer import categorize
+from fingerprints import bank_fingerprint
 from formatting import hx, money, parse_positive_amount
-from gemini_engine import generate_insight_text
-from i18n import LANGUAGES, t
-from image_prep import (
-    MAX_RECEIPT_BYTES, ReceiptImageError, prepare_receipt_image, sha256_file,
-)
-from money import tiyn_to_tenge
-from receipt_pipeline import extract_receipt
-from timeutil import TIMEZONE_CHOICES
-
-from handlers.common import *
-from keyboards.common import (
-    categories_keyboard, payments_keyboard, period_keyboard, with_back_button,
-)
+from handlers.common import text_hint, RECEIPT_SCOPE, ManualEntry
+from handlers.receipt import _default_payment_fields, _receipt_draft_view
+from handlers.stats import _budget_warnings_text
+from i18n import t
+from keyboards.common import categories_keyboard, payments_keyboard, with_back_button
+from services.transactions import create_quick_transaction, parse_quick_add_request
+import bank_import
+import db
 
 _with_back_button = with_back_button
 logger = logging.getLogger(__name__)
 
-
-from handlers.receipt import _default_payment_fields, _receipt_draft_view
-from handlers.stats import _budget_warnings_text
-from services.transactions import (
-    create_quick_transaction,
-    parse_quick_add_request,
-)
-
-
-router = Router(name="manual")
-
-QUICK_ADD_RE = re.compile(
-    r"^\s*([+-]?\d+(?:[.,]\d+)?)\s*(.*)$",
-    re.DOTALL,
-)
-
+router = Router(name='manual')
+QUICK_ADD_RE = re.compile('^\\s*([+-]?\\d+(?:[.,]\\d+)?)\\s*(.*)$', re.DOTALL)
 
 def _add_type_keyboard(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -73,14 +35,12 @@ def _add_type_keyboard(lang: str) -> InlineKeyboardMarkup:
         ]
     )
 
-
 def _add_back_keyboard(lang: str, step: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[
             InlineKeyboardButton(text=t("back_button", lang), callback_data=f"add_back:{step}")
         ]]
     )
-
 
 @router.message(Command("add"))
 async def cmd_add(message: Message, state: FSMContext):
@@ -147,7 +107,6 @@ async def add_choose_payment(callback: CallbackQuery, state: FSMContext):
     )
     await state.set_state(ManualEntry.entering_description)
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("add_back:"))
 async def add_go_back(callback: CallbackQuery, state: FSMContext):

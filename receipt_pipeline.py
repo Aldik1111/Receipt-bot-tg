@@ -9,7 +9,7 @@
 import logging
 
 from categorizer import categorize_many
-from gemini_engine import get_receipt_from_gemini
+from gemini_engine import call_with_quota, get_receipt_from_gemini
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +25,13 @@ EMPTY_RECEIPT = {
 
 
 def extract_receipt(image_path: str, user_id: int) -> tuple[dict, str | None]:
+    import db
+
+    day = db.user_today(user_id).isoformat()
     try:
-        result, err = get_receipt_from_gemini(image_path)
+        result, err = call_with_quota(
+            user_id, day, lambda: get_receipt_from_gemini(image_path)
+        )
     except Exception:
         logger.exception("Ошибка при распознавании чека через Gemini")
         return dict(EMPTY_RECEIPT), "unavailable"
@@ -34,6 +39,8 @@ def extract_receipt(image_path: str, user_id: int) -> tuple[dict, str | None]:
     if err:
         if err == "empty":
             logger.info("Gemini не нашёл товары на чеке")
+        elif err == "quota":
+            logger.info("gemini_quota denied user=%s day=%s", user_id, day)
         else:
             logger.info("Gemini не смог распознать чек: %s", err)
         return dict(EMPTY_RECEIPT), err

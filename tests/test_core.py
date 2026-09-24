@@ -43,6 +43,33 @@ class CategorizerTests(unittest.TestCase):
         self.assertEqual(categorize("contains beta", categories), "B")
 
 
+class DefaultCatalogLanguageTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.old_db_path = db.DB_PATH
+        db.DB_PATH = str(Path(self.tempdir.name) / "langcat.db")
+        db.init_db()
+
+    def tearDown(self):
+        db.DB_PATH = self.old_db_path
+        self.tempdir.cleanup()
+
+    def test_ensure_user_english_gets_other_not_prochee(self):
+        from categorizer import categorize_many
+
+        db.ensure_user(9, "en-user", language="en")
+        self.assertIsNotNone(db.get_category_id_by_name(9, "Other"))
+        self.assertIsNone(db.get_category_id_by_name(9, "Прочее"))
+        self.assertEqual(categorize_many(9, ["Молоко 3.2%"]), ["Groceries"])
+
+    def test_onboarding_language_switch_reseeds_empty_catalog(self):
+        db.ensure_user(8, "newbie")
+        self.assertIsNotNone(db.get_category_id_by_name(8, "Прочее"))
+        db.set_user_language(8, "en")
+        self.assertIsNotNone(db.get_category_id_by_name(8, "Other"))
+        self.assertIsNone(db.get_category_id_by_name(8, "Прочее"))
+
+
 class EmojiGraphemeTests(unittest.TestCase):
     def test_compound_family_emoji_is_one_grapheme(self):
         from formatting import grapheme_count, is_single_emoji
@@ -281,11 +308,20 @@ class ImportExportTests(unittest.TestCase):
         self.assertEqual(_month_start(date(2026, 1, 15), months_back=2), date(2025, 11, 1))
 
 
+class ConfigEnvTests(unittest.TestCase):
+    def test_env_strips_inline_comment_and_quotes(self):
+        from config import _env
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ' "abc123" # comment '}, clear=False):
+            self.assertEqual(_env("GEMINI_API_KEY"), "abc123")
+
+
 class GeminiParseTests(unittest.TestCase):
     def test_comma_price_does_not_drop_other_items(self):
         from gemini_engine import _parse_item_price
 
         self.assertEqual(_parse_item_price("123,45"), 12345)
+        self.assertEqual(_parse_item_price("450 ₸"), 45000)
         self.assertEqual(_parse_item_price(10), 1000)
         self.assertIsNone(_parse_item_price("abc"))
         self.assertIsNone(_parse_item_price(float("nan")))
@@ -310,6 +346,26 @@ class GeminiParseTests(unittest.TestCase):
         self.assertEqual(parsed["total"], 1250)
         self.assertIsNone(parsed["date"])
         self.assertEqual(len(parsed["store"]), 120)
+
+    def test_candidate_text_skips_gemini3_thoughts(self):
+        from gemini_engine import _candidate_text, _loads_model_json
+
+        payload = {
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thought": True, "text": "сначала подумаю"},
+                        {
+                            "thoughtSignature": "opaque",
+                            "text": '```json\n{"items":[{"name":"хлеб","price":100}]}\n```',
+                        },
+                    ]
+                }
+            }]
+        }
+        text = _candidate_text(payload)
+        data = _loads_model_json(text)
+        self.assertEqual(data["items"][0]["name"], "хлеб")
 
     def test_mime_from_magic_bytes(self):
         from gemini_engine import _guess_mime_type
@@ -1051,6 +1107,178 @@ class TransactionsApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 409)
 
+    async def test_patch_updates_all_fields_atomically(self):
+        category_id = db.get_category_id_by_name(1, "Транспорт")
+        payment_id = db.get_default_payment_method_id(1)
+        create = await self.client.post(
+            "/api/transactions",
+            json={
+                "type": "expense",
+                "amount": "500",
+                "category_id": db.get_category_id_by_name(1, "Продукты"),
+                "date": "2026-09-01",
+                "description": "молоко",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(create.status, 201)
+        tx_id = (await create.json())["id"]
+        response = await self.client.patch(
+            f"/api/transactions/{tx_id}",
+            json={
+                "type": "income",
+                "amount": "1500.50",
+                "category_id": category_id,
+                "date": "2026-09-10",
+                "description": "зарплата",
+                "store": "Kaspi",
+                "payment_method_id": payment_id,
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["type"], "income")
+        self.assertEqual(payload["amount"], 150050)
+        self.assertEqual(payload["category_id"], category_id)
+        self.assertEqual(payload["date"], "2026-09-10")
+        self.assertEqual(payload["description"], "зарплата")
+        self.assertEqual(payload["store"], "Kaspi")
+        self.assertEqual(payload["payment_method_id"], payment_id)
+        stored = db.get_transaction_by_id(1, tx_id)
+        self.assertEqual(int(stored["amount"]), 150050)
+        self.assertEqual(stored["type"], "income")
+        self.assertFalse(db.update_transaction_fields(2, tx_id, tx_type="expense", amount=100, category_id=category_id, op_date="2026-09-10", description="x", store=None, payment_method_id=None))
+        stored = db.get_transaction_by_id(1, tx_id)
+        self.assertEqual(stored["type"], "income")
+
+    async def test_public_health_hides_scheduler_names(self):
+        response = await self.client.get("/health")
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["db"], "ok")
+        self.assertIn(payload["status"], ("ok", "degraded", "error"))
+        self.assertNotIn("schedulers", payload)
+        self.assertTrue(all("schedul" not in key.lower() for key in payload))
+
+    async def test_delete_foreign_transaction_is_404(self):
+        with db.get_conn() as conn:
+            other_id = conn.execute(
+                "SELECT id FROM transactions WHERE user_id=2 LIMIT 1"
+            ).fetchone()[0]
+        response = await self.client.delete(
+            f"/api/transactions/{other_id}", headers=self.headers
+        )
+        self.assertEqual(response.status, 404)
+        self.assertIsNotNone(db.get_transaction_by_id(2, other_id))
+
+    async def test_delete_own_transaction(self):
+        category_id = db.get_category_id_by_name(1, "Транспорт")
+        created = await self.client.post(
+            "/api/transactions",
+            json={
+                "type": "expense",
+                "amount": "500",
+                "category_id": category_id,
+                "description": "такси",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(created.status, 201)
+        tx_id = (await created.json())["id"]
+        response = await self.client.delete(
+            f"/api/transactions/{tx_id}", headers=self.headers
+        )
+        self.assertEqual(response.status, 200)
+        self.assertIsNone(db.get_transaction_by_id(1, tx_id))
+
+    async def test_read_only_member_cannot_write(self):
+        db.ensure_user(3, "reader")
+        code = db.create_book_invite(1, "read")
+        self.assertEqual(db.join_book_invite(3, code), "ok")
+        headers = {
+            "X-Telegram-Init-Data": _signed_init_data(self.TOKEN, user={"id": 3})
+        }
+        with db.get_conn() as conn:
+            tx_id = conn.execute(
+                "SELECT id FROM transactions WHERE user_id=1 LIMIT 1"
+            ).fetchone()[0]
+        deleted = await self.client.delete(
+            f"/api/transactions/{tx_id}", headers=headers
+        )
+        self.assertEqual(deleted.status, 403)
+        category_id = db.get_category_id_by_name(1, "Транспорт")
+        budget = await self.client.post(
+            "/api/budgets",
+            json={"category_id": category_id, "monthly_limit": "10000"},
+            headers=headers,
+        )
+        self.assertEqual(budget.status, 403)
+
+    async def test_budget_upsert_and_foreign_404(self):
+        category_id = db.get_category_id_by_name(1, "Транспорт")
+        created = await self.client.post(
+            "/api/budgets",
+            json={"category_id": category_id, "monthly_limit": "20000"},
+            headers=self.headers,
+        )
+        self.assertEqual(created.status, 201)
+        payload = await created.json()
+        self.assertEqual(payload["limit"], 2000000)
+        self.assertEqual(payload["category_id"], category_id)
+        patched = await self.client.patch(
+            f"/api/budgets/{payload['id']}",
+            json={"monthly_limit": "15000"},
+            headers=self.headers,
+        )
+        self.assertEqual(patched.status, 200)
+        self.assertEqual((await patched.json())["limit"], 1500000)
+        other = await self.client.patch(
+            f"/api/budgets/{payload['id']}",
+            json={"monthly_limit": "1"},
+            headers={
+                "X-Telegram-Init-Data": _signed_init_data(
+                    self.TOKEN, user={"id": 2}
+                )
+            },
+        )
+        self.assertEqual(other.status, 404)
+
+    async def test_goal_contribute_creates_transfer(self):
+        created = await self.client.post(
+            "/api/goals",
+            json={"name": "Отпуск", "target_amount": "10000"},
+            headers=self.headers,
+        )
+        self.assertEqual(created.status, 201)
+        goal_id = (await created.json())["id"]
+        contrib = await self.client.post(
+            f"/api/goals/{goal_id}/contribute",
+            json={"amount": "500"},
+            headers=self.headers,
+        )
+        self.assertEqual(contrib.status, 200)
+        payload = await contrib.json()
+        self.assertEqual(payload["current"], 50000)
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT type, goal_id, goal_delta FROM transactions WHERE id=?",
+                (payload["transfer_id"],),
+            ).fetchone()
+        self.assertEqual(row["type"], "transfer")
+        self.assertEqual(row["goal_id"], goal_id)
+        self.assertEqual(int(row["goal_delta"]), 50000)
+        foreign = await self.client.post(
+            f"/api/goals/{goal_id}/contribute",
+            json={"amount": "100"},
+            headers={
+                "X-Telegram-Init-Data": _signed_init_data(
+                    self.TOKEN, user={"id": 2}
+                )
+            },
+        )
+        self.assertEqual(foreign.status, 404)
+
 
 class MoneyAndTimezoneTests(unittest.TestCase):
     def setUp(self):
@@ -1347,6 +1575,45 @@ class ReceiptSafetyTests(unittest.TestCase):
         self.assertEqual(db.get_gemini_quota_used(1, "2026-09-05"), 0)
         self.assertEqual(db.get_gemini_quota_used(1, "2026-08-20"), 0)
 
+    def test_categorize_and_insight_share_gemini_quota(self):
+        from categorizer import categorize_many
+        from gemini_engine import generate_insight_text
+
+        day = db.user_today(1).isoformat()
+        with patch("db.GEMINI_DAILY_LIMIT", 1), patch("db.GEMINI_PRO_LIMIT", 1):
+            ok, used = db.try_consume_gemini_quota(1, day)
+            self.assertTrue(ok)
+            self.assertEqual(used, 1)
+
+            with patch("gemini_engine.guess_categories_ai") as guess:
+                with patch("gemini_engine._post_gemini") as post:
+                    names = categorize_many(1, ["xyzunknownitem123"])
+            self.assertEqual(names, ["Прочее"])
+            guess.assert_not_called()
+            post.assert_not_called()
+            self.assertEqual(db.get_gemini_quota_used(1, day), 1)
+
+            with patch("gemini_engine._text_request") as text_request:
+                insight = generate_insight_text(
+                    {"total_expense": "1"}, "ru", user_id=1
+                )
+            self.assertIsNone(insight)
+            text_request.assert_not_called()
+            self.assertEqual(db.get_gemini_quota_used(1, day), 1)
+
+    def test_categorize_refunds_quota_on_gemini_network_error(self):
+        from categorizer import categorize_many
+
+        day = db.user_today(1).isoformat()
+        with patch(
+            "gemini_engine.guess_categories_ai",
+            return_value=({}, "network"),
+        ) as guess:
+            names = categorize_many(1, ["xyzunknownitem123"])
+        guess.assert_called_once()
+        self.assertEqual(names, ["Прочее"])
+        self.assertEqual(db.get_gemini_quota_used(1, day), 0)
+
     def test_duplicate_photo_fingerprint_warns_but_save_is_allowed(self):
         from fingerprints import photo_telegram_fingerprint
 
@@ -1453,21 +1720,30 @@ class ReceiptImageAndGeminiTests(unittest.TestCase):
     def test_extract_receipt_maps_rate_limit_and_empty(self):
         from receipt_pipeline import extract_receipt
 
-        with patch(
-            "receipt_pipeline.get_receipt_from_gemini",
-            return_value=(None, "rate_limit"),
-        ):
-            parsed, err = extract_receipt("unused.jpg", 1)
-        self.assertEqual(err, "rate_limit")
-        self.assertEqual(parsed["items"], [])
+        tempdir = tempfile.TemporaryDirectory()
+        old_db_path = db.DB_PATH
+        db.DB_PATH = str(Path(tempdir.name) / "test.db")
+        try:
+            db.init_db()
+            db.ensure_user(1, "owner")
+            with patch(
+                "receipt_pipeline.get_receipt_from_gemini",
+                return_value=(None, "rate_limit"),
+            ):
+                parsed, err = extract_receipt("unused.jpg", 1)
+            self.assertEqual(err, "rate_limit")
+            self.assertEqual(parsed["items"], [])
 
-        with patch(
-            "receipt_pipeline.get_receipt_from_gemini",
-            return_value=(None, "empty"),
-        ):
-            parsed, err = extract_receipt("unused.jpg", 1)
-        self.assertEqual(err, "empty")
-        self.assertEqual(parsed["items"], [])
+            with patch(
+                "receipt_pipeline.get_receipt_from_gemini",
+                return_value=(None, "empty"),
+            ):
+                parsed, err = extract_receipt("unused.jpg", 1)
+            self.assertEqual(err, "empty")
+            self.assertEqual(parsed["items"], [])
+        finally:
+            db.DB_PATH = old_db_path
+            tempdir.cleanup()
 
     def test_post_gemini_distinguishes_429_and_5xx(self):
         import gemini_engine

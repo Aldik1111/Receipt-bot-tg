@@ -68,6 +68,7 @@
   .actions { display: flex; gap: 8px; margin-top: 16px; }
   .actions button { flex: 1; padding: 10px; border: none; border-radius: 10px; cursor: pointer; }
   .primary { background: var(--tg-theme-button-color, #2481cc); color: var(--tg-theme-button-text-color, #fff); }
+  .danger { background: #e53935; color: #fff; }
   .custom-dates { display: none; gap: 8px; margin-bottom: 12px; }
   .custom-dates.open { display: flex; flex-wrap: wrap; }
   .custom-dates input { flex: 1; min-width: 120px; }
@@ -126,8 +127,14 @@
   </div>
 </div>
 <div id="app-error" class="empty" style="display:none"></div>
-<div id="view-budgets" style="display:none"><div class="card" id="budgets-list"></div></div>
-<div id="view-goals" style="display:none"><div class="card" id="goals-list"></div></div>
+<div id="view-budgets" style="display:none">
+  <div class="section-title"><span id="lbl-budgets-title">Budgets</span></div>
+  <div class="card" id="budgets-list"></div>
+</div>
+<div id="view-goals" style="display:none">
+  <div class="section-title"><span id="lbl-goals-title">Goals</span></div>
+  <div class="card" id="goals-list"></div>
+</div>
 <button class="fab" id="fab-add" type="button">+</button>
 
 <div class="modal" id="tx-modal">
@@ -149,7 +156,44 @@
     <select id="f-payment"></select>
     <div class="actions">
       <button type="button" id="form-cancel">Cancel</button>
+      <button type="button" class="danger" id="form-delete" style="display:none">Delete</button>
       <button type="button" class="primary" id="form-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="budget-modal">
+  <div class="sheet">
+    <div class="section-title" id="budget-form-title">Budget</div>
+    <label id="lbl-budget-category">Category</label>
+    <select id="b-category"></select>
+    <label id="lbl-budget-limit">Limit</label>
+    <input id="b-limit" inputmode="decimal">
+    <div class="actions">
+      <button type="button" id="budget-cancel">Cancel</button>
+      <button type="button" class="primary" id="budget-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="goal-modal">
+  <div class="sheet">
+    <div class="section-title" id="goal-form-title">Goal</div>
+    <div id="goal-fields">
+      <label id="lbl-goal-name">Name</label>
+      <input id="g-name">
+      <label id="lbl-goal-target">Target</label>
+      <input id="g-target" inputmode="decimal">
+      <label id="lbl-goal-deadline">Deadline</label>
+      <input id="g-deadline" type="date">
+    </div>
+    <div id="contribute-fields" style="display:none">
+      <label id="lbl-contribute-amount">Amount</label>
+      <input id="g-contribute" inputmode="decimal">
+    </div>
+    <div class="actions">
+      <button type="button" id="goal-cancel">Cancel</button>
+      <button type="button" class="primary" id="goal-save">Save</button>
     </div>
   </div>
 </div>
@@ -169,7 +213,11 @@ let currentCategory = "all";
 let chart = null;
 let txOffset = 0;
 let editingId = null;
+let editingBudgetId = null;
+let editingGoalId = null;
+let goalMode = "create";
 const TX_PAGE = 50;
+const canWrite = () => !!me.can_write;
 
 function tr(key, fallback) {
   return I18N[key] || fallback || key;
@@ -234,6 +282,19 @@ function applyI18n() {
   setText("lbl-form-pay", tr("form_payment"));
   setText("form-cancel", tr("cancel_button"));
   setText("form-save", tr("save_button"));
+  setText("form-delete", tr("delete_button"));
+  setText("lbl-budgets-title", tr("tab_budgets"));
+  setText("lbl-goals-title", tr("tab_goals"));
+  setText("lbl-budget-category", tr("form_category"));
+  setText("lbl-budget-limit", tr("form_limit"));
+  setText("budget-cancel", tr("cancel_button"));
+  setText("budget-save", tr("save_button"));
+  setText("lbl-goal-name", tr("form_goal_name"));
+  setText("lbl-goal-target", tr("form_target"));
+  setText("lbl-goal-deadline", tr("form_deadline"));
+  setText("lbl-contribute-amount", tr("form_amount"));
+  setText("goal-cancel", tr("cancel_button"));
+  setText("goal-save", tr("save_button"));
   document.getElementById("fab-add").setAttribute("aria-label", tr("add_button"));
 }
 
@@ -343,16 +404,21 @@ async function loadBudgets() {
   data.items.forEach((b) => {
     const wrap = document.createElement("div");
     wrap.style.marginBottom = "14px";
-    const row = document.createElement("div");
+    const row = document.createElement("button");
     row.className = "list-item";
+    row.type = "button";
     row.style.border = "none";
     row.style.padding = "2px 0";
-    row.style.cursor = "default";
     const name = document.createElement("span");
     name.textContent = b.category;
     const nums = document.createElement("span");
     nums.textContent = `${b.spent_formatted} / ${b.limit_formatted}`;
     row.append(name, nums);
+    if (canWrite()) {
+      row.addEventListener("click", () => openBudgetForm(b));
+    } else {
+      row.style.cursor = "default";
+    }
     const barBg = document.createElement("div");
     barBg.className = "bar-bg";
     const barFill = document.createElement("div");
@@ -377,16 +443,21 @@ async function loadGoals() {
   data.items.forEach((g) => {
     const wrap = document.createElement("div");
     wrap.style.marginBottom = "14px";
-    const row = document.createElement("div");
+    const row = document.createElement("button");
     row.className = "list-item";
+    row.type = "button";
     row.style.border = "none";
     row.style.padding = "2px 0";
-    row.style.cursor = "default";
     const name = document.createElement("span");
     name.textContent = g.name;
     const nums = document.createElement("span");
     nums.textContent = `${g.current_formatted} / ${g.target_formatted}`;
     row.append(name, nums);
+    if (canWrite()) {
+      row.addEventListener("click", () => openGoalForm(g, "edit"));
+    } else {
+      row.style.cursor = "default";
+    }
     const barBg = document.createElement("div");
     barBg.className = "bar-bg";
     const barFill = document.createElement("div");
@@ -396,6 +467,18 @@ async function loadGoals() {
     barFill.style.background = "var(--tg-theme-button-color,#2481cc)";
     barBg.appendChild(barFill);
     wrap.append(row, barBg);
+    if (canWrite()) {
+      const contribute = document.createElement("button");
+      contribute.type = "button";
+      contribute.className = "tab";
+      contribute.style.marginTop = "8px";
+      contribute.textContent = tr("btn_contribute");
+      contribute.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openGoalForm(g, "contribute");
+      });
+      wrap.appendChild(contribute);
+    }
     el.appendChild(wrap);
   });
 }
@@ -424,6 +507,7 @@ function openForm(item) {
   document.getElementById("f-description").value = item && item.description ? item.description : "";
   document.getElementById("f-store").value = item && item.store ? item.store : "";
   document.getElementById("f-payment").value = item && item.payment_method_id ? String(item.payment_method_id) : "";
+  document.getElementById("form-delete").style.display = item && canWrite() ? "block" : "none";
   document.getElementById("tx-modal").classList.add("open");
 }
 
@@ -457,6 +541,121 @@ async function saveForm() {
   }
 }
 
+function fillBudgetCategorySelect(lockedId) {
+  const select = document.getElementById("b-category");
+  const items = [
+    { id: "", name: tr("overall_expenses") },
+    ...me.categories,
+  ];
+  fillSelect(select, items);
+  if (lockedId === null) {
+    select.value = "";
+  } else if (lockedId != null) {
+    select.value = String(lockedId);
+  }
+  select.disabled = lockedId !== undefined && lockedId !== false && editingBudgetId != null;
+}
+
+function openBudgetForm(item) {
+  editingBudgetId = item ? item.id : null;
+  setText("budget-form-title", item ? tr("edit_button") : tr("btn_overall_budget"));
+  fillBudgetCategorySelect(item ? item.category_id : false);
+  document.getElementById("b-limit").value = item ? (Number(item.limit) / 100).toString() : "";
+  document.getElementById("budget-modal").classList.add("open");
+}
+
+function closeBudgetForm() {
+  document.getElementById("budget-modal").classList.remove("open");
+  editingBudgetId = null;
+}
+
+async function saveBudgetForm() {
+  const categoryRaw = document.getElementById("b-category").value;
+  const payload = {
+    monthly_limit: document.getElementById("b-limit").value,
+    category_id: categoryRaw === "" ? null : Number(categoryRaw),
+  };
+  try {
+    if (editingBudgetId) {
+      await api(`/api/budgets/${editingBudgetId}`, { method: "PATCH", body: JSON.stringify({ monthly_limit: payload.monthly_limit }) });
+    } else {
+      await api("/api/budgets", { method: "POST", body: JSON.stringify(payload) });
+    }
+    closeBudgetForm();
+    await refresh();
+  } catch (e) {
+    document.getElementById("app-error").style.display = "block";
+    document.getElementById("app-error").textContent = tr("save_error");
+  }
+}
+
+function openGoalForm(item, mode) {
+  goalMode = mode || (item ? "edit" : "create");
+  editingGoalId = item ? item.id : null;
+  const contribute = goalMode === "contribute";
+  document.getElementById("goal-fields").style.display = contribute ? "none" : "block";
+  document.getElementById("contribute-fields").style.display = contribute ? "block" : "none";
+  setText("goal-form-title", contribute ? tr("btn_contribute") : (item ? tr("edit_button") : tr("btn_new_goal")));
+  document.getElementById("g-name").value = item && item.name ? item.name : "";
+  document.getElementById("g-target").value = item ? (Number(item.target) / 100).toString() : "";
+  document.getElementById("g-deadline").value = item && item.deadline ? item.deadline : "";
+  document.getElementById("g-contribute").value = "";
+  document.getElementById("goal-modal").classList.add("open");
+}
+
+function closeGoalForm() {
+  document.getElementById("goal-modal").classList.remove("open");
+  editingGoalId = null;
+  goalMode = "create";
+}
+
+async function saveGoalForm() {
+  try {
+    if (goalMode === "contribute") {
+      await api(`/api/goals/${editingGoalId}/contribute`, {
+        method: "POST",
+        body: JSON.stringify({ amount: document.getElementById("g-contribute").value }),
+      });
+    } else if (editingGoalId) {
+      await api(`/api/goals/${editingGoalId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: document.getElementById("g-name").value,
+          target_amount: document.getElementById("g-target").value,
+          deadline: document.getElementById("g-deadline").value,
+        }),
+      });
+    } else {
+      await api("/api/goals", {
+        method: "POST",
+        body: JSON.stringify({
+          name: document.getElementById("g-name").value,
+          target_amount: document.getElementById("g-target").value,
+          deadline: document.getElementById("g-deadline").value || null,
+        }),
+      });
+    }
+    closeGoalForm();
+    await refresh();
+  } catch (e) {
+    document.getElementById("app-error").style.display = "block";
+    document.getElementById("app-error").textContent = tr("save_error");
+  }
+}
+
+async function deleteCurrentTx() {
+  if (!editingId) return;
+  try {
+    await api(`/api/transactions/${editingId}`, { method: "DELETE" });
+    closeForm();
+    txOffset = 0;
+    await refresh();
+  } catch (e) {
+    document.getElementById("app-error").style.display = "block";
+    document.getElementById("app-error").textContent = tr("save_error");
+  }
+}
+
 document.getElementById("main-tabs").addEventListener("click", (e) => {
   const btn = e.target.closest(".tab");
   if (!btn) return;
@@ -466,7 +665,7 @@ document.getElementById("main-tabs").addEventListener("click", (e) => {
   ["overview","budgets","goals"].forEach(name => {
     document.getElementById("view-" + name).style.display = (name === currentTab) ? "block" : "none";
   });
-  document.getElementById("fab-add").style.display = currentTab === "overview" ? "block" : "none";
+  document.getElementById("fab-add").style.display = canWrite() ? "block" : "none";
   refresh();
 });
 
@@ -502,9 +701,18 @@ document.getElementById("tx-next").addEventListener("click", () => {
   txOffset += TX_PAGE;
   refresh();
 });
-document.getElementById("fab-add").addEventListener("click", () => openForm(null));
+document.getElementById("fab-add").addEventListener("click", () => {
+  if (currentTab === "budgets") openBudgetForm(null);
+  else if (currentTab === "goals") openGoalForm(null, "create");
+  else openForm(null);
+});
 document.getElementById("form-cancel").addEventListener("click", closeForm);
 document.getElementById("form-save").addEventListener("click", saveForm);
+document.getElementById("form-delete").addEventListener("click", deleteCurrentTx);
+document.getElementById("budget-cancel").addEventListener("click", closeBudgetForm);
+document.getElementById("budget-save").addEventListener("click", saveBudgetForm);
+document.getElementById("goal-cancel").addEventListener("click", closeGoalForm);
+document.getElementById("goal-save").addEventListener("click", saveGoalForm);
 
 (async function init() {
   try {
@@ -512,6 +720,7 @@ document.getElementById("form-save").addEventListener("click", saveForm);
     I18N = me.translations || {};
     applyI18n();
     applyCatalog();
+    document.getElementById("fab-add").style.display = canWrite() ? "block" : "none";
     document.getElementById("date-from").value = me.today || "";
     document.getElementById("date-to").value = me.today || "";
     await refresh();
